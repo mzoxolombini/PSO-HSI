@@ -339,9 +339,20 @@ def calculate_metrics(original, segmented, ground_truth, train_mask):
     from skimage.metrics import peak_signal_noise_ratio as psnr
     from skimage.metrics import structural_similarity as ssim
 
-    # Calculate PSNR and SSIM
-    psnr_value = psnr(original, segmented)
-    ssim_value = ssim(original, segmented, data_range=segmented.max() - segmented.min())
+    # Convert images to float and normalize
+    original_float = original.astype(np.float64)
+    segmented_float = segmented.astype(np.float64)
+
+    # Calculate data range for PSNR
+    data_range = original_float.max() - original_float.min()
+
+    # Calculate PSNR with explicit data range
+    psnr_value = psnr(original_float, segmented_float, data_range=data_range)
+
+    # Calculate SSIM with explicit data range
+    ssim_value = ssim(original_float, segmented_float,
+                      data_range=data_range,
+                      win_size=3)  # smaller window for smaller images
 
     # Prepare data for classification
     X = original.reshape(-1, 1)
