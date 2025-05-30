@@ -7,16 +7,19 @@ from sklearn.metrics import accuracy_score, cohen_kappa_score
 import time
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
-from skimage.morphology import disk
+from skimage.morphology import disk, opening, closing
 from skimage.filters import rank
-
+from skimage.feature import local_binary_pattern
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from scipy.ndimage import median_filter
+import os
+import urllib.request
+from scipy.io import loadmat
 
 class IPSO:
     def __init__(self, image, k_levels=10, population_size=20, max_iter=30,
                  w_initial=0.7, c_x=1.7, c_y=1.7, replace_ratio=0.3):
-        """
-        Improved IPSO implementation with all suggested fixes
-        """
         self.image = image
         self.k_levels = k_levels
         self.pop_size = population_size
@@ -26,29 +29,16 @@ class IPSO:
         self.c_y = c_y
         self.replace_ratio = replace_ratio
 
-        # Dimensionality reduction and preprocessing
         self.pca = PCA(n_components=1)
         self.gray = self.pca.fit_transform(image.reshape(-1, image.shape[-1]))
         self.gray = self.gray.reshape(image.shape[0], image.shape[1])
         self.gray = ((self.gray - self.gray.min()) /
                      (self.gray.max() - self.gray.min()) * 255).astype(np.uint8)
 
-        def add_spatial_features(gray):
-            features = [gray]
-            for radius in [3, 5, 7]:
-                features.append(rank.entropy(gray, disk(radius)))
-                features.append(rank.mean(gray, disk(radius)))
-            return np.stack(features, axis=-1)
-
-        self.spatial_features = add_spatial_features(self.gray)
-
-        # Add spatial features (EMAP approximation)
         self.spatial_feat = filters.sobel(self.gray)
+        self.D = 2 * (k_levels - 1)
+        self.eps = 1e-10
 
-        self.D = 2 * (k_levels - 1)  # Number of fuzzy parameters
-        self.eps = 1e-10  # For numerical stability
-
-        # Initialize swarms
         self.swarms = [{
             'positions': np.random.uniform(0, 255, (population_size, 1)),
             'velocities': np.zeros((population_size, 1)),
@@ -63,19 +53,17 @@ class IPSO:
         self.best_fitness_history = []
 
     def trapezoidal_membership(self, n, a, b):
-        """Improved membership function with bounds checking"""
         n = np.clip(n, 0, 255)
-        if b - a < 1e-6:  # Avoid division by zero
+        if b - a < 1e-6:
             return np.where(n <= a, 1.0, 0.0)
         return np.where(n <= a, 1.0, np.where(n <= b, (b - n) / (b - a), 0.0))
 
     def calculate_fuzzy_entropy(self, thresholds):
-        """Robust fuzzy entropy calculation with divide-by-zero and NaN protection"""
         hist, _ = np.histogram(self.gray, bins=256, range=(0, 255))
-        hist = np.cumsum(hist) / np.sum(hist)  # Equalized histogram
+        hist = np.cumsum(hist) / np.sum(hist)
 
         total_entropy = 0.0
-        thresholds = [0] + sorted(thresholds) + [255]  # Ensure ordered
+        thresholds = [0] + sorted(thresholds) + [255]
         x = np.arange(256)
 
         for k in range(1, self.k_levels + 1):
@@ -100,47 +88,41 @@ class IPSO:
                                                          0))))
 
             if np.isnan(mu).any():
-                continue  # skip this membership function if it's invalid
+                continue
 
             R_k = np.sum(hist * mu)
             if R_k > self.eps:
                 terms = (hist * mu) / R_k
-                terms = np.clip(terms, self.eps, 1)  # Prevent log(0)
+                terms = np.clip(terms, self.eps, 1)
                 H_k = -np.sum(terms * np.log(terms))
                 total_entropy += H_k
 
         return total_entropy
 
     def evaluate_fitness(self, particle_positions, dim):
-        """Vectorized fitness evaluation"""
         temp_CP = self.CP.copy()
         temp_CP[dim] = float(particle_positions[0])
         return self.calculate_fuzzy_entropy(temp_CP)
 
     def update_velocity_position(self, swarm_idx):
-        """Optimized position update"""
         swarm = self.swarms[swarm_idx]
         w = self.w_initial - (self.w_initial / self.max_iter) * self.iteration
 
         for i in range(self.pop_size):
-            # Tournament selection
             f = i if np.random.rand() > 0.5 else \
                 np.random.choice(self.pop_size, 2, replace=False)[
                     np.argmax(swarm['pb_fitness'][np.random.choice(self.pop_size, 2)])]
 
-            # Update velocity
             r1, r2 = np.random.rand(), np.random.rand()
             cognitive = self.c_x * r1 * (swarm['pb_positions'][f] - swarm['positions'][i])
             social = self.c_y * r2 * (swarm['gb_position'] - swarm['positions'][i])
             swarm['velocities'][i] = np.clip(
                 w * swarm['velocities'][i] + cognitive + social, -10, 10)
 
-            # Update position
             swarm['positions'][i] = np.clip(
                 swarm['positions'][i] + swarm['velocities'][i], 0, 255)
 
     def replace_worst_particles(self, swarm_idx):
-        """Efficient particle replacement"""
         swarm = self.swarms[swarm_idx]
         num_replace = int(self.pop_size * self.replace_ratio)
         idx = np.argpartition(swarm['pb_fitness'], num_replace)
@@ -151,10 +133,8 @@ class IPSO:
         swarm['pb_fitness'][idx[:num_replace]] = swarm['pb_fitness'][idx[-num_replace:]].copy()
 
     def optimize(self):
-        """Optimized main loop"""
         start_time = time.time()
 
-        # Initialize
         for dim in range(self.D):
             swarm = self.swarms[dim]
             for i in range(self.pop_size):
@@ -165,7 +145,6 @@ class IPSO:
                     swarm['gb_position'] = swarm['positions'][i].copy()
             self.CP[dim] = float(swarm['gb_position'][0])
 
-        # Main loop
         for self.iteration in range(self.max_iter):
             for dim, swarm in enumerate(self.swarms):
                 if swarm['stagnation_count'] >= 5:
@@ -189,87 +168,69 @@ class IPSO:
             if (self.iteration + 1) % 10 == 0:
                 print(f"Iter {self.iteration + 1}/{self.max_iter}, Best: {self.best_fitness_history[-1]:.4f}")
 
-        # Get final thresholds
         thresholds = sorted((self.CP[2 * i] + self.CP[2 * i + 1]) / 2 for i in range(self.k_levels - 1))
         return [0] + thresholds + [255], time.time() - start_time, self.best_fitness_history
 
-    def segment_image(self, thresholds):
-        """Soft segmentation with membership degrees"""
-        segmented = np.zeros_like(self.gray, dtype=np.float32)
-        for i in range(len(thresholds) - 1):
-            mask = np.where(self.gray <= thresholds[i], 1,
-                            np.where(self.gray >= thresholds[i + 1], 0,
-                                     (thresholds[i + 1] - self.gray) / (thresholds[i + 1] - thresholds[i])))
-            segmented += i * mask
 
-        # === INSERT MEDIAN FILTER HERE ===
-        from scipy.ndimage import median_filter
-        segmented = median_filter(segmented.astype(np.uint8), size=3)
-        # =================================
+def segment_image(gray, thresholds):
+    segmented = np.zeros_like(gray, dtype=np.float32)
+    gray_norm = gray.astype(np.float32) / 255.0
 
-        return segmented
+    for i in range(len(thresholds)-1):
+        lower = thresholds[i] / 255.0
+        upper = thresholds[i+1] / 255.0
+        delta = max(upper - lower, 1e-10)
+        mask = np.where(gray_norm <= lower, 1.0,
+                       np.where(gray_norm >= upper, 0.0,
+                              (upper - gray_norm)/delta))
+        segmented += i * mask
+
+    segmented = np.round(segmented).astype(np.uint8)
+    segmented = median_filter(segmented, size=3)
+    segmented = opening(segmented, disk(1))
+    segmented = closing(segmented, disk(2))
+    return segmented
 
 
 def calculate_metrics(original, segmented, ground_truth, train_mask):
-    """Enhanced metric calculation"""
-    # PSNR/SSIM
     data_range = original.max() - original.min()
     psnr_val = psnr(original, segmented, data_range=data_range)
     ssim_val = ssim(original, segmented, data_range=data_range, win_size=3)
 
-    # === MODIFY FEATURE PREPARATION ===
-    # Use both spectral and spatial features
     spectral_feat = original.reshape(-1, 1)
     spatial_feat = segmented.reshape(-1, 1)
-
-    # If using the spatial_features from IPSO class:
-    # spatial_feat = ipso.spatial_features.reshape(-1, ipso.spatial_features.shape[-1])
-
-    # Classification with spatial features
     X = np.concatenate([spectral_feat, spatial_feat], axis=1)
     y = ground_truth.ravel()
 
     X_train, y_train = X[train_mask.ravel() == 1], y[train_mask.ravel() == 1]
     X_test, y_test = X[train_mask.ravel() == 0], y[train_mask.ravel() == 0]
 
-    clf = SVC(kernel='rbf', C=100, gamma='scale', class_weight='balanced')  # Tuned parameters
+    clf = make_pipeline(
+        StandardScaler(),
+        SVC(kernel='rbf', C=10, gamma='auto', class_weight='balanced')
+    )
     clf.fit(X_train, y_train)
     y_pred = clf.predict(X_test)
 
-    return (psnr_val, ssim_val,
-            accuracy_score(y_test, y_pred),
-            cohen_kappa_score(y_test, y_pred))
+    return psnr_val, ssim_val, accuracy_score(y_test, y_pred), cohen_kappa_score(y_test, y_pred)
 
 
 def load_real_data():
-    """Load Indian Pines dataset with automatic download if needed"""
-    import os
-    import urllib.request
-    from scipy.io import loadmat
-
-    # Create data directory if it doesn't exist
     os.makedirs('data', exist_ok=True)
-
-    # Download dataset if not present
     if not os.path.exists('data/indianpinearray.npy') or not os.path.exists('data/IPgt.npy'):
         print("Downloading Indian Pines dataset...")
         url = "https://www.ehu.eus/ccwintco/uploads/6/67/Indian_pines_corrected.mat"
         gt_url = "https://www.ehu.eus/ccwintco/uploads/c/c4/Indian_pines_gt.mat"
-
         urllib.request.urlretrieve(url, 'data/Indian_pines_corrected.mat')
         urllib.request.urlretrieve(gt_url, 'data/Indian_pines_gt.mat')
-
-        # Convert .mat to .npy
         image = loadmat('data/Indian_pines_corrected.mat')['indian_pines_corrected']
         gt = loadmat('data/Indian_pines_gt.mat')['indian_pines_gt']
-
         np.save('data/indianpinearray.npy', image)
         np.save('data/IPgt.npy', gt)
     else:
         image = np.load('data/indianpinearray.npy')
         gt = np.load('data/IPgt.npy')
 
-    # Create training mask (10% of pixels per class)
     train_mask = np.zeros_like(gt)
     for class_id in np.unique(gt):
         if class_id == 0: continue
@@ -288,9 +249,8 @@ def main():
         ipso = IPSO(image, k_levels=k)
         thresholds, time_elapsed, _ = ipso.optimize()
 
-        segmented = ipso.segment_image(thresholds)
-        psnr_val, ssim_val, oa, kappa = calculate_metrics(
-            ipso.gray, segmented, gt, train_mask)
+        segmented = segment_image(ipso.gray, thresholds)
+        psnr_val, ssim_val, oa, kappa = calculate_metrics(ipso.gray, segmented, gt, train_mask)
 
         print(f"\nResults for {k} levels:")
         threshold_pairs = [(int(round(thresholds[i])), int(round(thresholds[i + 1])))
@@ -300,17 +260,11 @@ def main():
         print(f"OA: {oa:.4f}, Kappa: {kappa:.4f}")
         print(f"Time: {time_elapsed:.2f}s")
 
-        # Visualization
-        plt.figure(figsize=(15, 5))
-        plt.subplot(1, 3, 1);
-        plt.imshow(ipso.gray, cmap='gray');
-        plt.title('PCA Component')
-        plt.subplot(1, 3, 2);
-        plt.imshow(gt);
-        plt.title('Ground Truth')
-        plt.subplot(1, 3, 3);
-        plt.imshow(segmented);
-        plt.title(f'Segmented (k={k})')
+        plt.figure(figsize=(15, 10))
+        plt.subplot(131); plt.imshow(ipso.gray, cmap='gray'); plt.title('PCA Component')
+        plt.subplot(132); plt.imshow(segmented); plt.title('Segmentation')
+        plt.subplot(133); plt.imshow(gt); plt.title('Ground Truth')
+        plt.tight_layout()
         plt.show()
 
 
