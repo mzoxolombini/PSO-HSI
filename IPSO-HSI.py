@@ -7,6 +7,8 @@ from sklearn.metrics import accuracy_score, cohen_kappa_score
 import time
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
+from skimage.morphology import disk
+from skimage.filters import rank
 
 
 class IPSO:
@@ -30,6 +32,15 @@ class IPSO:
         self.gray = self.gray.reshape(image.shape[0], image.shape[1])
         self.gray = ((self.gray - self.gray.min()) /
                      (self.gray.max() - self.gray.min()) * 255).astype(np.uint8)
+
+        def add_spatial_features(gray):
+            features = [gray]
+            for radius in [3, 5, 7]:
+                features.append(rank.entropy(gray, disk(radius)))
+                features.append(rank.mean(gray, disk(radius)))
+            return np.stack(features, axis=-1)
+
+        self.spatial_features = add_spatial_features(self.gray)
 
         # Add spatial features (EMAP approximation)
         self.spatial_feat = filters.sobel(self.gray)
@@ -61,7 +72,7 @@ class IPSO:
     def calculate_fuzzy_entropy(self, thresholds):
         """Robust fuzzy entropy calculation with divide-by-zero and NaN protection"""
         hist, _ = np.histogram(self.gray, bins=256, range=(0, 255))
-        hist = hist.astype(float) / (hist.sum() + self.eps)
+        hist = np.cumsum(hist) / np.sum(hist)  # Equalized histogram
 
         total_entropy = 0.0
         thresholds = [0] + sorted(thresholds) + [255]  # Ensure ordered
@@ -183,20 +194,20 @@ class IPSO:
         return [0] + thresholds + [255], time.time() - start_time, self.best_fitness_history
 
     def segment_image(self, thresholds):
-        """Soft segmentation with membership degrees (robust against divide-by-zero)"""
+        """Soft segmentation with membership degrees"""
         segmented = np.zeros_like(self.gray, dtype=np.float32)
-
         for i in range(len(thresholds) - 1):
-            t_low = thresholds[i]
-            t_high = thresholds[i + 1]
-            delta = max(t_high - t_low, self.eps)  # Prevent divide-by-zero
-
-            mask = np.where(self.gray <= t_low, 1,
-                            np.where(self.gray >= t_high, 0,
-                                     (t_high - self.gray) / delta))
+            mask = np.where(self.gray <= thresholds[i], 1,
+                            np.where(self.gray >= thresholds[i + 1], 0,
+                                     (thresholds[i + 1] - self.gray) / (thresholds[i + 1] - thresholds[i])))
             segmented += i * mask
 
-        return segmented.astype(np.uint8)
+        # === INSERT MEDIAN FILTER HERE ===
+        from scipy.ndimage import median_filter
+        segmented = median_filter(segmented.astype(np.uint8), size=3)
+        # =================================
+
+        return segmented
 
 
 def calculate_metrics(original, segmented, ground_truth, train_mask):
@@ -206,14 +217,22 @@ def calculate_metrics(original, segmented, ground_truth, train_mask):
     psnr_val = psnr(original, segmented, data_range=data_range)
     ssim_val = ssim(original, segmented, data_range=data_range, win_size=3)
 
+    # === MODIFY FEATURE PREPARATION ===
+    # Use both spectral and spatial features
+    spectral_feat = original.reshape(-1, 1)
+    spatial_feat = segmented.reshape(-1, 1)
+
+    # If using the spatial_features from IPSO class:
+    # spatial_feat = ipso.spatial_features.reshape(-1, ipso.spatial_features.shape[-1])
+
     # Classification with spatial features
-    X = np.column_stack([original.ravel(), filters.sobel(original).ravel()])
+    X = np.concatenate([spectral_feat, spatial_feat], axis=1)
     y = ground_truth.ravel()
 
     X_train, y_train = X[train_mask.ravel() == 1], y[train_mask.ravel() == 1]
     X_test, y_test = X[train_mask.ravel() == 0], y[train_mask.ravel() == 0]
 
-    clf = SVC(kernel='rbf', C=10, gamma=0.1)  # Tuned parameters
+    clf = SVC(kernel='rbf', C=100, gamma='scale', class_weight='balanced')  # Tuned parameters
     clf.fit(X_train, y_train)
     y_pred = clf.predict(X_test)
 
