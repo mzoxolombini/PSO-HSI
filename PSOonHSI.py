@@ -18,6 +18,8 @@ from tqdm import tqdm
 from skimage.morphology import disk, square, dilation, erosion
 from skimage.feature import graycomatrix, graycoprops
 from sklearn.metrics import accuracy_score, cohen_kappa_score, confusion_matrix
+from skimage import color, exposure
+
 
 
 # ---------------------- Improved IPSO Implementation ----------------------
@@ -35,41 +37,41 @@ def trapezoidal_membership(n, a, b, prev_b, next_a):
 
 
 @jit(nopython=True)
-def calculate_fuzzy_entropy_numba(image_flat, thresholds):
-    """Simplified fuzzy entropy calculation for Numba compatibility"""
-    hist = np.zeros(256)
-    for val in image_flat:
-        hist[int(val)] += 1
-    hist = hist / (hist.sum() + 1e-10)
-
-    thresholds_sorted = np.sort(thresholds)
-    thresholds_full = np.concatenate((np.array([0.0]), thresholds_sorted, np.array([255.0])))
-
+def calculate_color_fuzzy_entropy(image_lab_flat, thresholds):
+    """Compute fuzzy entropy over L*, a*, b* color histograms."""
     total_entropy = 0.0
 
-    for k in range(1, len(thresholds_full)):
-        a = thresholds_full[k - 1]
-        b = thresholds_full[k]
-        prev_b = thresholds_full[k - 2] if k > 1 else -1.0
-        next_a = thresholds_full[k + 1] if k < len(thresholds_full) - 1 else -1.0
+    for ch in range(3):  # L*, a*, b* channels
+        hist = np.zeros(256)
+        for i in range(image_lab_flat.shape[0]):
+            hist[int(image_lab_flat[i, ch])] += 1
+        hist = hist / (hist.sum() + 1e-10)
 
-        R_k = 0.0
-        for n in range(256):
-            mu = trapezoidal_membership(float(n), a, b, prev_b, next_a)
-            R_k += hist[n] * mu
+        thresholds_sorted = np.sort(thresholds)
+        thresholds_full = np.concatenate((np.array([0.0]), thresholds_sorted, np.array([255.0])))
 
-        H_k = 0.0
-        if R_k > 1e-10:
+        for k in range(1, len(thresholds_full)):
+            a = thresholds_full[k - 1]
+            b = thresholds_full[k]
+            prev_b = thresholds_full[k - 2] if k > 1 else -1.0
+            next_a = thresholds_full[k + 1] if k < len(thresholds_full) - 1 else -1.0
+
+            R_k = 0.0
             for n in range(256):
                 mu = trapezoidal_membership(float(n), a, b, prev_b, next_a)
-                p = (hist[n] * mu) / R_k
-                if p > 1e-10:
-                    H_k -= p * np.log(p)
+                R_k += hist[n] * mu
 
-        total_entropy += H_k
+            H_k = 0.0
+            if R_k > 1e-10:
+                for n in range(256):
+                    mu = trapezoidal_membership(float(n), a, b, prev_b, next_a)
+                    p = (hist[n] * mu) / R_k
+                    if p > 1e-10:
+                        H_k -= p * np.log(p)
+
+            total_entropy += H_k
 
     return total_entropy
-
 
 class ImprovedIPSO:
     def __init__(self, image, k_levels=10):
@@ -110,10 +112,10 @@ class ImprovedIPSO:
         return self.calculate_fuzzy_entropy(temp_CP)
 
     def calculate_fuzzy_entropy(self, thresholds):
-        """Ensure thresholds are float64 for Numba compatibility"""
-        return calculate_fuzzy_entropy_numba(
-            self.image.flatten().astype(np.float64),
-            np.array(thresholds, dtype=np.float64))
+        return calculate_color_fuzzy_entropy(
+            self.image.reshape(-1, 3).astype(np.float64),
+            np.array(thresholds, dtype=np.float64)
+        )
 
     def optimize(self):
         """Improved optimization with better stagnation handling"""
@@ -221,6 +223,24 @@ def preprocess_hyperspectral(image):
     pc = pca.fit_transform(data)
 
     return pc.reshape(orig_shape[0], orig_shape[1], -1)
+
+def convert_to_lab(image):
+    """Convert PCA-reduced HSI to RGB then to Lab color space."""
+    # Use first 3 PCs as RGB approximation
+    rgb_approx = image[..., :3]
+    rgb_norm = (rgb_approx - rgb_approx.min()) / (rgb_approx.max() - rgb_approx.min())
+    rgb_norm = np.clip(rgb_norm, 0, 1)
+
+    # Convert to Lab
+    lab_image = color.rgb2lab(rgb_norm)
+
+    # Rescale each channel to [0, 255]
+    lab_scaled = np.zeros_like(lab_image)
+    lab_scaled[..., 0] = exposure.rescale_intensity(lab_image[..., 0], out_range=(0, 255))  # L*
+    lab_scaled[..., 1] = exposure.rescale_intensity(lab_image[..., 1], out_range=(0, 255))  # a*
+    lab_scaled[..., 2] = exposure.rescale_intensity(lab_image[..., 2], out_range=(0, 255))  # b*
+
+    return lab_scaled.astype(np.uint8)
 
 
 def create_emap(pc_image):
@@ -390,16 +410,18 @@ def main():
     image, gt, train_mask = load_indian_pines()
     pc_image = preprocess_hyperspectral(image)
 
-    # Use first PC for segmentation (as in paper)
-    gray = exposure.rescale_intensity(pc_image[..., 0], out_range=(0, 255)).astype(np.uint8)
-
     results = []
+
     for k in [10, 12, 14]:
         print(f"\nProcessing k={k} levels...")
         start_time = time.time()
 
+        # Convert PCA image to Lab
+        lab_image = convert_to_lab(pc_image)
+        gray = lab_image[..., 0]  # Use L* channel for segmentation
+
         # 1. Improved IPSO Segmentation
-        ipso = ImprovedIPSO(gray, k_levels=k)
+        ipso = ImprovedIPSO(lab_image, k_levels=k)
         thresholds = ipso.optimize()
         segmented = segment_image(gray, thresholds)
 
@@ -416,8 +438,7 @@ def main():
 
         # 4. Evaluation
         psnr_val = psnr(gray, segmented, data_range=255)
-        ssim_val = ssim(gray, segmented,
-                        win_size=7, channel_axis=None, data_range=255)
+        ssim_val = ssim(gray, segmented, win_size=7, channel_axis=None, data_range=255)
 
         results.append({
             'k': k,
@@ -432,14 +453,14 @@ def main():
 
         # Visualization
         plt.figure(figsize=(15, 5))
-        plt.subplot(131);
-        plt.imshow(gray, cmap='gray');
-        plt.title('Original')
-        plt.subplot(132);
-        plt.imshow(segmented);
-        plt.title('Segmented')
-        plt.subplot(133);
-        plt.imshow(gt);
+        plt.subplot(131)
+        plt.imshow(gray, cmap='gray')
+        plt.title('L* Channel')
+        plt.subplot(132)
+        plt.imshow(segmented)
+        plt.title(f'Segmented (k={k})')
+        plt.subplot(133)
+        plt.imshow(gt)
         plt.title('Ground Truth')
         plt.show()
 
