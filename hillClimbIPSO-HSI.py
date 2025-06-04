@@ -18,6 +18,8 @@ from skimage.util import img_as_ubyte
 from skimage.filters.rank import gradient
 import warnings
 import datetime
+from sklearn.metrics import classification_report
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 
 warnings.filterwarnings("ignore")
 
@@ -124,15 +126,26 @@ def segment_image(gray, thresholds):
     return segmented
 
 def calculate_metrics(original, segmented, ground_truth, train_mask):
-    data_range = original.max() - original.min()
-    psnr_val = psnr(original, segmented, data_range=data_range)
-    ssim_val = ssim(original, segmented, data_range=data_range, win_size=3)
+    def compute_emap(gray):
+        gray_ubyte = img_as_ubyte((gray - gray.min()) / (gray.max() - gray.min()))
+        profiles = []
+        for selem_size in [1, 3, 5]:
+            selem = disk(selem_size)
+            profiles.append(opening(gray_ubyte, selem))
+            profiles.append(closing(gray_ubyte, selem))
+            profiles.append(gradient(gray_ubyte, selem))
+        return np.stack(profiles, axis=-1)
 
-    emap_feat = compute_emap(original)
+    data_range = gray.max() - gray.min()
+    psnr_val = psnr(gray, segmented, data_range=data_range)
+    ssim_val = ssim(gray, segmented, data_range=data_range, win_size=3)
+
+    emap_feat = compute_emap(gray)
     height, width, n_features = emap_feat.shape
     emap_feat = emap_feat.reshape(-1, n_features)
-    lbp_feat = local_binary_pattern(original, P=8, R=1).reshape(-1, 1)
-    spectral_feat = original.reshape(-1, 1)
+
+    lbp_feat = local_binary_pattern(gray, P=8, R=1).reshape(-1, 1)
+    spectral_feat = gray.reshape(-1, 1)
     seg_feat = segmented.reshape(-1, 1)
 
     X = np.concatenate([emap_feat, spectral_feat, seg_feat, lbp_feat], axis=1)
@@ -141,18 +154,28 @@ def calculate_metrics(original, segmented, ground_truth, train_mask):
     train_idx = train_mask.ravel() == 1
     test_idx = train_mask.ravel() == 0
     X_train, y_train = X[train_idx], y[train_idx]
-    X_test, y_test = X[test_idx], y[test_idx]  # <-- fixed here
+    X_test, y_test = X[test_idx], y[test_idx]
 
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
     X_test = scaler.transform(X_test)
 
-    clf = RandomForestClassifier(n_estimators=100, random_state=42)
+    if classifier_name == 'RF':
+        clf = RandomForestClassifier(n_estimators=100, class_weight='balanced')
+    elif classifier_name == 'GB':
+        clf = GradientBoostingClassifier(n_estimators=100)
+    else:
+        clf = SVC(kernel='rbf', C=10, gamma='auto', class_weight='balanced')
+
     clf.fit(X_train, y_train)
     y_pred = clf.predict(X_test)
 
     oa = accuracy_score(y_test, y_pred)
     kappa = cohen_kappa_score(y_test, y_pred)
+
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred, zero_division=0))
+
     return psnr_val, ssim_val, oa, kappa
 
 def load_real_data():
@@ -240,18 +263,18 @@ def main():
     for k in [10, 12, 14]:
         print(f"\nRunning IPSO + Fuzzy Entropy + Local Search for {k} levels...")
         thresholds, _, fitness_curve = ipso_optimize(gray, k_levels=k)
-        # Ensure thresholds is a flat list
-        if isinstance(thresholds[0], (list, np.ndarray)):
-            thresholds = thresholds[0]
         segmented = segment_image(gray, thresholds)
-        psnr_val, ssim_val, oa, kappa = calculate_metrics(gray, segmented, gt, train_mask)
+        psnr_val, ssim_val, oa, kappa = calculate_metrics(gray, segmented, gt, train_mask, classifier_name='RF')
 
         print(f"\nResults for {k} levels:")
         print("Thresholds:", thresholds)
         print(f"PSNR: {psnr_val:.2f} dB, SSIM: {ssim_val:.4f}")
         print(f"OA: {oa:.4f}, Kappa: {kappa:.4f}")
 
+        # Save to CSV log with timestamp
         log_results_to_csv(k, thresholds, psnr_val, ssim_val, oa, kappa)
+
+        # Visualize segmentations and convergence
         visualize_results(gray, segmented, gt, k, fitness_curve)
 
 if __name__ == "__main__":
