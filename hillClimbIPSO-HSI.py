@@ -17,9 +17,16 @@ from scipy.io import loadmat
 from skimage.util import img_as_ubyte
 from skimage.filters.rank import gradient
 import warnings
-import datetime
+from datetime import datetime
 from sklearn.metrics import classification_report
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.neural_network import MLPClassifier
+import spectral as spy
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+from pathlib import Path
+import csv
+from scipy.io import loadmat
+
 
 warnings.filterwarnings("ignore")
 
@@ -125,47 +132,26 @@ def segment_image(gray, thresholds):
     segmented = closing(segmented, disk(2))
     return segmented
 
-def calculate_metrics(original, segmented, ground_truth, train_mask):
-    def compute_emap(gray):
-        gray_ubyte = img_as_ubyte((gray - gray.min()) / (gray.max() - gray.min()))
-        profiles = []
-        for selem_size in [1, 3, 5]:
-            selem = disk(selem_size)
-            profiles.append(opening(gray_ubyte, selem))
-            profiles.append(closing(gray_ubyte, selem))
-            profiles.append(gradient(gray_ubyte, selem))
-        return np.stack(profiles, axis=-1)
 
-    data_range = gray.max() - gray.min()
-    psnr_val = psnr(gray, segmented, data_range=data_range)
-    ssim_val = ssim(gray, segmented, data_range=data_range, win_size=3)
+def calculate_metrics(original, segmented, gt, train_mask, classifier_name='MLP'):
+    # Calculate data range
+    data_range = original.max() - original.min()
 
-    emap_feat = compute_emap(gray)
-    height, width, n_features = emap_feat.shape
-    emap_feat = emap_feat.reshape(-1, n_features)
+    # Now these will work because we imported them properly
+    psnr_val = peak_signal_noise_ratio(original, segmented, data_range=data_range)
+    ssim_val = structural_similarity(original, segmented, data_range=data_range)
 
-    lbp_feat = local_binary_pattern(gray, P=8, R=1).reshape(-1, 1)
-    spectral_feat = gray.reshape(-1, 1)
-    seg_feat = segmented.reshape(-1, 1)
+    # Rest of your classification code...
+    X = original.reshape(-1, 1)
+    y = gt.ravel()
 
-    X = np.concatenate([emap_feat, spectral_feat, seg_feat, lbp_feat], axis=1)
-    y = ground_truth.ravel()
+    X_train, y_train = X[train_mask.ravel()], y[train_mask.ravel()]
+    X_test, y_test = X[~train_mask.ravel()], y[~train_mask.ravel()]
 
-    train_idx = train_mask.ravel() == 1
-    test_idx = train_mask.ravel() == 0
-    X_train, y_train = X[train_idx], y[train_idx]
-    X_test, y_test = X[test_idx], y[test_idx]
-
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
-
-    if classifier_name == 'RF':
-        clf = RandomForestClassifier(n_estimators=100, class_weight='balanced')
-    elif classifier_name == 'GB':
-        clf = GradientBoostingClassifier(n_estimators=100)
+    if classifier_name == 'MLP':
+        clf = MLPClassifier(hidden_layer_sizes=(100,), max_iter=300, random_state=42)
     else:
-        clf = SVC(kernel='rbf', C=10, gamma='auto', class_weight='balanced')
+        raise ValueError("Unsupported classifier")
 
     clf.fit(X_train, y_train)
     y_pred = clf.predict(X_test)
@@ -173,109 +159,144 @@ def calculate_metrics(original, segmented, ground_truth, train_mask):
     oa = accuracy_score(y_test, y_pred)
     kappa = cohen_kappa_score(y_test, y_pred)
 
-    print("\nClassification Report:")
-    print(classification_report(y_test, y_pred, zero_division=0))
-
     return psnr_val, ssim_val, oa, kappa
 
-def load_real_data():
+def load_dataset(name='IndianPines'):
     os.makedirs('data', exist_ok=True)
-    if not os.path.exists('data/indianpinearray.npy') or not os.path.exists('data/IPgt.npy'):
-        print("Downloading Indian Pines dataset...")
+
+    if name == 'IndianPines':
         url = "https://www.ehu.eus/ccwintco/uploads/6/67/Indian_pines_corrected.mat"
         gt_url = "https://www.ehu.eus/ccwintco/uploads/c/c4/Indian_pines_gt.mat"
-        urllib.request.urlretrieve(url, 'data/Indian_pines_corrected.mat')
-        urllib.request.urlretrieve(gt_url, 'data/Indian_pines_gt.mat')
-        image = loadmat('data/Indian_pines_corrected.mat')['indian_pines_corrected']
-        gt = loadmat('data/Indian_pines_gt.mat')['indian_pines_gt']
-        np.save('data/indianpinearray.npy', image)
-        np.save('data/IPgt.npy', gt)
+        image_file = 'data/Indian_pines_corrected.mat'
+        gt_file = 'data/Indian_pines_gt.mat'
+        img_key, gt_key = 'indian_pines_corrected', 'indian_pines_gt'
+
+    elif name == 'Salinas':
+        url = "https://www.ehu.eus/ccwintco/uploads/a/a3/Salinas_corrected.mat"
+        gt_url = "https://www.ehu.eus/ccwintco/uploads/f/fa/Salinas_gt.mat"
+        image_file = 'data/Salinas_corrected.mat'
+        gt_file = 'data/Salinas_gt.mat'
+        img_key, gt_key = 'salinas_corrected', 'salinas_gt'
+
+    elif name == 'PaviaU':
+        url = "https://www.ehu.eus/ccwintco/uploads/e/ee/PaviaU.mat"
+        gt_url = "https://www.ehu.eus/ccwintco/uploads/5/50/PaviaU_gt.mat"
+        image_file = 'data/PaviaU.mat'
+        gt_file = 'data/PaviaU_gt.mat'
+        img_key, gt_key = 'paviaU', 'paviaU_gt'
+
     else:
-        image = np.load('data/indianpinearray.npy')
-        gt = np.load('data/IPgt.npy')
+        raise ValueError(f"Unsupported dataset: {name}")
+
+    if not os.path.exists(image_file):
+        urllib.request.urlretrieve(url, image_file)
+    if not os.path.exists(gt_file):
+        urllib.request.urlretrieve(gt_url, gt_file)
+
+    image = loadmat(image_file)[img_key]
+    gt = loadmat(gt_file)[gt_key]
 
     train_mask = np.zeros_like(gt)
     for class_id in np.unique(gt):
         if class_id == 0:
             continue
         pixels = np.argwhere(gt == class_id)
-        train_indices = np.random.choice(len(pixels), max(1, int(0.1 * len(pixels))), replace=False)
-        train_mask[tuple(pixels[train_indices].T)] = 1
+        sample_size = max(1, int(0.1 * len(pixels)))
+        selected = np.random.choice(len(pixels), sample_size, replace=False)
+        train_mask[tuple(pixels[selected].T)] = 1
 
     return image, gt, train_mask
 
-def log_results_to_csv(k, thresholds, psnr_val, ssim_val, oa, kappa, filename="results_log.csv"):
-    import csv
-    import os
-    file_exists = os.path.isfile(filename)
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(filename, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        if not file_exists:
-            writer.writerow(["Timestamp", "k", "Thresholds", "PSNR", "SSIM", "OA", "Kappa"])
-        writer.writerow([
-            timestamp,
-            k,
-            str(thresholds),
-            f"{psnr_val:.2f}",
-            f"{ssim_val:.4f}",
-            f"{oa:.4f}",
-            f"{kappa:.4f}"
-        ])
 
-def visualize_results(gray, segmented, gt, k, fitness_curve):
-    plt.figure(figsize=(15, 4))
-    plt.subplot(1, 3, 1)
-    plt.imshow(gray, cmap='gray')
-    plt.title(f"Gray PCA Image")
-    plt.axis('off')
+def log_results_to_csv(k, thresholds, psnr_val, ssim_val, oa, kappa, filename):
+    """
+    Logs experiment results to a CSV file with headers and automatic file creation
 
-    plt.subplot(1, 3, 2)
+    Args:
+        k (int): Number of threshold levels
+        thresholds (list): List of threshold values
+        psnr_val (float): PSNR value
+        ssim_val (float): SSIM value
+        oa (float): Overall accuracy
+        kappa (float): Kappa coefficient
+        filename (str): Output CSV filename
+    """
+    # Prepare data row
+    data = {
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'k_levels': k,
+        'thresholds': '|'.join(map(str, thresholds)),  # Store as pipe-separated string
+        'psnr': f"{psnr_val:.4f}",
+        'ssim': f"{ssim_val:.4f}",
+        'oa': f"{oa:.4f}",
+        'kappa': f"{kappa:.4f}"
+    }
+
+    # Field names for CSV header
+    fieldnames = ['timestamp', 'k_levels', 'thresholds', 'psnr', 'ssim', 'oa', 'kappa']
+
+    # Create parent directories if they don't exist
+    filepath = Path(filename)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write to CSV
+    try:
+        file_exists = filepath.exists()
+
+        with open(filepath, mode='a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+
+            # Write header only if file doesn't exist
+            if not file_exists:
+                writer.writeheader()
+
+            writer.writerow(data)
+
+    except Exception as e:
+        print(f"Error writing to CSV file {filename}: {str(e)}")
+        raise
+
+
+def visualize_results(original, segmented, gt, k, fitness_curve):
+    plt.figure(figsize=(15, 5))
+
+    plt.subplot(131)
+    plt.imshow(original, cmap='gray')
+    plt.title('Original Image')
+
+    plt.subplot(132)
     plt.imshow(segmented, cmap='nipy_spectral')
-    plt.title(f"Segmented Output (k={k})")
-    plt.axis('off')
+    plt.title(f'Segmented (K={k})')
 
-    plt.subplot(1, 3, 3)
-    plt.imshow(gt, cmap='jet')
-    plt.title("Ground Truth")
-    plt.axis('off')
+    plt.subplot(133)
+    plt.plot(fitness_curve)
+    plt.title('Fitness Curve')
 
     plt.tight_layout()
     plt.show()
 
-    if fitness_curve:
-        plt.figure(figsize=(6, 4))
-        plt.plot(fitness_curve, label='Fuzzy Entropy')
-        plt.title(f"Fitness Convergence (k={k})")
-        plt.xlabel("Iteration")
-        plt.ylabel("Fuzzy Entropy")
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
 def main():
-    image, gt, train_mask = load_real_data()
-    pca = PCA(n_components=1)
-    gray = pca.fit_transform(image.reshape(-1, image.shape[-1])).reshape(image.shape[:2])
-    gray = ((gray - gray.min()) / (gray.max() - gray.min()) * 255).astype(np.uint8)
+    datasets = ['IndianPines', 'Salinas', 'PaviaU']
+    for dataset_name in datasets:
+        print(f"\nProcessing dataset: {dataset_name}")
+        image, gt, train_mask = load_dataset(name=dataset_name)
+        pca = PCA(n_components=1)
+        gray = pca.fit_transform(image.reshape(-1, image.shape[-1])).reshape(image.shape[:2])
+        gray = ((gray - gray.min()) / (gray.max() - gray.min()) * 255).astype(np.uint8)
 
-    for k in [10, 12, 14]:
-        print(f"\nRunning IPSO + Fuzzy Entropy + Local Search for {k} levels...")
-        thresholds, _, fitness_curve = ipso_optimize(gray, k_levels=k)
-        segmented = segment_image(gray, thresholds)
-        psnr_val, ssim_val, oa, kappa = calculate_metrics(gray, segmented, gt, train_mask, classifier_name='RF')
+        for k in [10, 12, 14]:
+            print(f"\nRunning IPSO + Fuzzy Entropy + Local Search for {k} levels...")
+            thresholds, _, fitness_curve = ipso_optimize(gray, k_levels=k)
+            segmented = segment_image(gray, thresholds)
+            psnr_val, ssim_val, oa, kappa = calculate_metrics(gray, segmented, gt, train_mask, classifier_name='MLP')
 
-        print(f"\nResults for {k} levels:")
-        print("Thresholds:", thresholds)
-        print(f"PSNR: {psnr_val:.2f} dB, SSIM: {ssim_val:.4f}")
-        print(f"OA: {oa:.4f}, Kappa: {kappa:.4f}")
+            print(f"\nResults for {k} levels:")
+            print("Thresholds:", thresholds)
+            print(f"PSNR: {psnr_val:.2f} dB, SSIM: {ssim_val:.4f}")
+            print(f"OA: {oa:.4f}, Kappa: {kappa:.4f}")
 
-        # Save to CSV log with timestamp
-        log_results_to_csv(k, thresholds, psnr_val, ssim_val, oa, kappa)
-
-        # Visualize segmentations and convergence
-        visualize_results(gray, segmented, gt, k, fitness_curve)
+            log_results_to_csv(k, thresholds, psnr_val, ssim_val, oa, kappa, filename=f"results_{dataset_name}.csv")
+            visualize_results(gray, segmented, gt, k, fitness_curve)
 
 if __name__ == "__main__":
     main()

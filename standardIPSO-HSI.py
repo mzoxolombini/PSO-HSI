@@ -19,6 +19,7 @@ from skimage.morphology import disk, square, dilation, erosion
 from skimage.feature import graycomatrix, graycoprops
 from sklearn.metrics import accuracy_score, cohen_kappa_score, confusion_matrix
 import requests
+from sklearn.utils.class_weight import compute_class_weight
 
 
 # ---------------------- Improved IPSO Implementation ----------------------
@@ -454,7 +455,6 @@ def main():
 if __name__ == "__main__":
     from sklearn.utils.class_weight import compute_class_weight
 
-    main()import numpy as np
 import matplotlib.pyplot as plt
 from skimage import color, filters, morphology, exposure, feature, segmentation
 from sklearn.decomposition import PCA
@@ -908,6 +908,4 @@ def main():
 
 
 if __name__ == "__main__":
-    from sklearn.utils.class_weight import compute_class_weight
-
     main()
