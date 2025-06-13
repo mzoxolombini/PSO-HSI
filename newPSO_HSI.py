@@ -3,15 +3,18 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.io import loadmat
 from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
 from sklearn.metrics import accuracy_score, cohen_kappa_score
+from scipy.optimize import linear_sum_assignment
 from pathlib import Path
 import warnings
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
 import pandas as pd
 import random
-from skimage.feature import local_binary_pattern
+from scipy.stats import entropy
+from skimage.filters.rank import entropy as local_entropy
+from skimage.morphology import disk
 
 warnings.filterwarnings("ignore")
 
@@ -28,6 +31,8 @@ Q_table = {a: 0 for a in actions}
 epsilon = 0.3
 alpha = 0.1
 gamma = 0.9
+
+RL_strategy_log = []  # for tracking
 
 def choose_action():
     if random.random() < epsilon:
@@ -101,6 +106,7 @@ def simulated_annealing(image, thresholds):
 # --- Adaptive Local Search Controller ---
 def rl_local_search(image, thresholds):
     action = choose_action()
+    RL_strategy_log.append(action)
     if action == 'greedy':
         refined, score = greedy_hill_climbing(image, thresholds)
     elif action == 'random':
@@ -153,6 +159,17 @@ def apply_thresholds(image, thresholds):
         segmented[mask] = i + 1
     return segmented
 
+# --- Label Mapping for Accuracy ---
+def hungarian_label_matching(gt, segmented):
+    from sklearn.metrics import confusion_matrix
+    y_true = gt.flatten()
+    y_pred = segmented.flatten()
+    cm = confusion_matrix(y_true, y_pred)
+    row_ind, col_ind = linear_sum_assignment(-cm)
+    mapping = {col: row for row, col in zip(row_ind, col_ind)}
+    new_seg = np.array([mapping.get(label, 0) for label in y_pred])
+    return new_seg.reshape(gt.shape)
+
 # --- Main Function ---
 def main():
     data_dir = Path(r"C:\Users\mzoxo\OneDrive\Documents\data")
@@ -178,8 +195,9 @@ def main():
             reshaped = img.reshape(-1, img.shape[-1])
             pca = PCA(n_components=3)
             pc_img = pca.fit_transform(reshaped).reshape(*img.shape[:2], 3)
-            lbp = np.mean([local_binary_pattern(pc_img[:, :, i], P=8, R=1, method="uniform") for i in range(3)], axis=0)
-            fused = ((lbp - lbp.min()) / (lbp.max() - lbp.min()) * 255).astype(np.uint8)
+            gray_pca = np.mean(pc_img, axis=-1)
+
+            fused = ((gray_pca - gray_pca.min()) / (gray_pca.max() - gray_pca.min()) * 255).astype(np.uint8)
 
             thresholds = pso_segmentation(fused, m_thresholds)
             segmented = apply_thresholds(fused, thresholds)
@@ -196,8 +214,14 @@ def main():
                 gt_key = [k for k in gt_data.keys() if not k.startswith('__')][0]
                 gt = gt_data[gt_key]
                 if gt.shape == segmented.shape:
-                    acc = accuracy_score(gt.flatten(), segmented.flatten())
-                    kappa = cohen_kappa_score(gt.flatten(), segmented.flatten())
+                    aligned_seg = hungarian_label_matching(gt, segmented)
+                    flat_features = fused.reshape(-1, 1)
+                    flat_labels = aligned_seg.flatten()
+                    clf = SVC(kernel='rbf')
+                    clf.fit(flat_features, flat_labels)
+                    predicted = clf.predict(flat_features).reshape(gt.shape)
+                    acc = accuracy_score(gt.flatten(), predicted.flatten())
+                    kappa = cohen_kappa_score(gt.flatten(), predicted.flatten())
                     print(f"OA: {acc:.4f} | Kappa: {kappa:.4f}")
                 else:
                     print(f"GT shape mismatch: {gt.shape} vs {segmented.shape}")
@@ -220,8 +244,8 @@ def main():
 
             plt.figure(figsize=(12, 4))
             plt.subplot(1, 3, 1)
-            plt.imshow(fused, cmap='gray')
-            plt.title("LBP-Fused")
+            plt.imshow(gray_pca, cmap='gray')
+            plt.title("Original Image (Grayscale PCA)")
 
             plt.subplot(1, 3, 2)
             plt.imshow(segmented, cmap='nipy_spectral')
@@ -251,6 +275,9 @@ def main():
         plt.grid(True)
         plt.tight_layout()
         plt.show()
+
+    print("\nRL Strategy Usage Log:")
+    print(pd.Series(RL_strategy_log).value_counts())
 
 if __name__ == "__main__":
     main()
