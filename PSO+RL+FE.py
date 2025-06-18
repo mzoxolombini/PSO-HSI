@@ -3,8 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.io import loadmat
 from sklearn.decomposition import PCA
-from sklearn.metrics import accuracy_score, cohen_kappa_score, precision_score, recall_score, f1_score, \
-    classification_report, confusion_matrix
+from sklearn.metrics import accuracy_score, cohen_kappa_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix
 from sklearn.svm import SVC
 from sklearn.model_selection import train_test_split
 from skimage.filters import gabor
@@ -19,6 +18,7 @@ from skimage.segmentation import slic
 from imblearn.over_sampling import SMOTE
 from sklearn.preprocessing import StandardScaler
 from scipy.ndimage import generic_filter
+from skimage.exposure import rescale_intensity
 
 try:
     from skimage.feature import graycomatrix, graycoprops
@@ -27,7 +27,6 @@ except ImportError:
 
 warnings.filterwarnings("ignore")
 
-# --- Parameters ---
 n_particles = 30
 n_iterations = 50
 w, c1, c2 = 0.7, 1.5, 1.5
@@ -36,8 +35,6 @@ F, CR, n_elites = 0.8, 0.95, 10
 RL_strategy_log = []
 DE_improvements = []
 
-
-# --- Feature Extraction ---
 def extract_features(image):
     features, base_shape = [], image.shape
     for theta in range(4):
@@ -47,7 +44,9 @@ def extract_features(image):
                 if real.shape == base_shape: features.append(real)
                 if imag.shape == base_shape: features.append(imag)
     try:
-        glcm = graycomatrix(img_as_ubyte(image), distances=[5], angles=[0], levels=256, symmetric=True, normed=True)
+        image_rescaled = rescale_intensity(image, in_range='image', out_range=(0, 1))
+        img_u8 = img_as_ubyte(np.clip(image_rescaled, 0, 1))
+        glcm = graycomatrix(img_u8, distances=[5], angles=[0], levels=256, symmetric=True, normed=True)
         for prop in ['contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation']:
             features.append(np.full(base_shape, graycoprops(glcm, prop)[0, 0]))
     except Exception as e:
@@ -57,14 +56,12 @@ def extract_features(image):
         features.extend([erosion(image, selem), dilation(image, selem)])
     return np.stack(features, axis=-1)
 
-
-# --- Fuzzy Entropy ---
 def fuzzy_entropy(image, thresholds):
     thresholds = np.sort(thresholds)
     thresholds = np.concatenate(([0], thresholds, [256]))
     total = 0
     for i in range(len(thresholds) - 1):
-        mask = (image >= thresholds[i]) & (image < thresholds[i + 1])
+        mask = (image >= thresholds[i]) & (image < thresholds[i+1])
         region = image[mask].astype(np.uint8)
         if len(region) == 0: continue
         hist, _ = np.histogram(region, bins=256, range=(0, 255), density=True)
@@ -72,11 +69,8 @@ def fuzzy_entropy(image, thresholds):
         total += -np.sum(hist * np.log(hist))
     return total
 
-
-# --- RL-based Local Search ---
 def choose_action():
     return np.random.choice(['greedy', 'tabu', 'annealing', 'random'], p=[0.4, 0.2, 0.2, 0.2])
-
 
 def rl_local_search(image, population, scores):
     action = choose_action()
@@ -110,8 +104,6 @@ def rl_local_search(image, population, scores):
         scores = np.array([fuzzy_entropy(image, p) for p in population])
     return population, scores
 
-
-# --- Hybrid DE ---
 def hybrid_de(image, population, scores):
     elite_idx = np.argsort(scores)[-n_elites:]
     elites = population[elite_idx].copy()
@@ -130,8 +122,6 @@ def hybrid_de(image, population, scores):
     DE_improvements.append(improvements)
     return population, scores
 
-
-# --- PSO with RL and DE ---
 def pso_segmentation(image, n_thresholds):
     segments = slic(image, n_segments=n_thresholds * 5, compactness=10, channel_axis=None)
     super_vals = [np.mean(image[segments == i]) for i in np.unique(segments)]
@@ -161,20 +151,14 @@ def pso_segmentation(image, n_thresholds):
             gbest = particles[np.argmax(pbest_scores)]
     return np.sort(gbest)
 
-
-# --- Apply thresholds ---
 def apply_thresholds(image, thresholds):
     thresholds = np.sort(thresholds)
     result = np.zeros_like(image)
     for i, t in enumerate(thresholds): result[image > t] = i + 1
     return result
 
+svm = SVC(kernel='rbf', C=100, gamma=0.01, decision_function_shape='ovr')
 
-# --- Define SVM globally ---
-svm = SVC(kernel='rbf', C=10, gamma='scale', decision_function_shape='ovr')
-
-
-# --- Main loop (to be placed in your main function/file) ---
 def main():
     dataset_path = "C:/Users/mzoxo/OneDrive/Documents/data/Indian_pines_corrected.mat"
     gt_path = "C:/Users/mzoxo/OneDrive/Documents/data/Indian_pines_gt.mat"
@@ -184,9 +168,9 @@ def main():
     h, w, d = image.shape
     image_2d = image.reshape(-1, d)
 
-    # Apply PCA
-    pca = PCA(n_components=1)
-    reduced = pca.fit_transform(image_2d).reshape(h, w)
+    pca = PCA(n_components=30)
+    pca_result = pca.fit_transform(image_2d)
+    reduced = pca_result[:, 0].reshape(h, w)
 
     results = []
     for k in range(1, 15):
@@ -203,7 +187,10 @@ def main():
 
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.9, stratify=y, random_state=42)
 
-        smote = SMOTE()
+        from collections import Counter
+        min_class_size = min(Counter(y_train).values())
+        k_neighbors = min(5, min_class_size - 1) if min_class_size > 1 else 1
+        smote = SMOTE(k_neighbors=k_neighbors)
         X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
 
         svm.fit(X_train_res, y_train_res)
@@ -212,11 +199,22 @@ def main():
         acc = accuracy_score(y_test, y_pred)
         kappa = cohen_kappa_score(y_test, y_pred)
         print(f"OA: {acc:.4f} | Kappa: {kappa:.4f}")
+        print(classification_report(y_test, y_pred, zero_division=0))
         results.append({"k": k, "OA": acc, "Kappa": kappa})
 
     df = pd.DataFrame(results)
     print(df)
+    df.to_csv("PSO_RL_FE_SVM_results.csv", index=False)
 
+    plt.plot(df["k"], df["OA"], marker='o', label="OA")
+    plt.plot(df["k"], df["Kappa"], marker='s', label="Kappa")
+    plt.title("PSO+RL+FE+SVM-CK Performance (Indian Pines)")
+    plt.xlabel("Thresholds (k)")
+    plt.ylabel("Score")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("performance_plot.png")
+    plt.show()
 
 if __name__ == "__main__":
     main()
