@@ -35,8 +35,10 @@ class RLAgent:
         self.iteration = 0  # Add iteration counter
 
     def choose_action(self, n_iterations):
-        # Adaptive exploration rate
-        exploration_rate = max(0.1, 0.5 - (self.iteration / n_iterations) * 0.4)
+        exploration_rate = max(
+            self.min_exploration,
+            self.max_exploration - (self.iteration / n_iterations) * self.exploration_decay
+        )
         if np.random.random() < exploration_rate:
             return np.random.choice(list(self.q_values.keys()))
         return max(self.q_values, key=self.q_values.get)
@@ -124,10 +126,10 @@ def random_restart_hill_climbing(image, current, current_score, restarts=3):
     return best, best_score
 
 
-def apply_rl_local_search(image, particles, scores, rl_agent):
+def apply_rl_local_search(image, particles, scores, rl_agent, n_iterations):
     improved = False
     for i in range(len(particles)):
-        action = rl_agent.choose_action()
+        action = rl_agent.choose_action(n_iterations)  # Pass n_iterations here
 
         if action == 'simple_hill':
             new_p, new_score = simple_hill_climbing(image, particles[i], scores[i])
