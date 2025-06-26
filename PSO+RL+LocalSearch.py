@@ -2,7 +2,6 @@ import numpy as np
 from scipy.io import loadmat
 from sklearn.decomposition import PCA
 from skimage.util import img_as_ubyte
-from skimage.filters.rank import gradient
 from skimage.morphology import disk
 import warnings
 import os
@@ -18,7 +17,6 @@ w, c1, c2 = 0.7, 1.5, 1.5
 # RL Parameters
 learning_rate = 0.1
 discount_factor = 0.9
-exploration_rate = max(0.1, 0.5 - (iter/n_iterations)*0.4)
 
 
 class RLAgent:
@@ -32,7 +30,10 @@ class RLAgent:
         }
         self.action_counts = {k: 0 for k in self.q_values.keys()}
         self.reward_history = []
-        self.iteration = 0  # Add iteration counter
+        self.iteration = 0
+        self.min_exploration = 0.1
+        self.max_exploration = 0.5
+        self.exploration_decay = 0.4
 
     def choose_action(self, n_iterations):
         exploration_rate = max(
@@ -49,7 +50,7 @@ class RLAgent:
         )
         self.action_counts[action] += 1
         self.reward_history.append(reward)
-        self.iteration += 1  # Increment iteration counter
+        self.iteration += 1
 
 
 def compute_fuzzy_entropy(image, thresholds):
@@ -77,13 +78,14 @@ def simple_hill_climbing(image, current, current_score, max_neighbors=10):
         if score > best_score:
             best = neighbor
             best_score = score
-            return best, best_score  # Return first improvement
+            return best, best_score
     return best, best_score
 
 
-def steepest_ascent_hill_climbing(image, current, current_score, max_neighbors=10 + k*2):
+def steepest_ascent_hill_climbing(image, current, current_score, k, max_neighbors=20):
     best = current.copy()
     best_score = current_score
+    max_neighbors = 10 + k * 2
     for _ in range(max_neighbors):
         neighbor = np.clip(current + np.random.randint(-5, 6, current.shape), 1, 254)
         neighbor = np.sort(neighbor)
@@ -126,15 +128,15 @@ def random_restart_hill_climbing(image, current, current_score, restarts=3):
     return best, best_score
 
 
-def apply_rl_local_search(image, particles, scores, rl_agent, n_iterations):
+def apply_rl_local_search(image, particles, scores, rl_agent, n_iterations, k):
     improved = False
     for i in range(len(particles)):
-        action = rl_agent.choose_action(n_iterations)  # Pass n_iterations here
+        action = rl_agent.choose_action(n_iterations)
 
         if action == 'simple_hill':
             new_p, new_score = simple_hill_climbing(image, particles[i], scores[i])
         elif action == 'steepest_ascent':
-            new_p, new_score = steepest_ascent_hill_climbing(image, particles[i], scores[i])
+            new_p, new_score = steepest_ascent_hill_climbing(image, particles[i], scores[i], k)
         elif action == 'stochastic':
             new_p, new_score = stochastic_hill_climbing(image, particles[i], scores[i])
         elif action == 'first_choice':
@@ -142,7 +144,7 @@ def apply_rl_local_search(image, particles, scores, rl_agent, n_iterations):
         elif action == 'random_restart':
             new_p, new_score = random_restart_hill_climbing(image, particles[i], scores[i])
 
-        reward = (new_score - scores[i]) / (scores[i] + 1e-8) * (1 + k/15)
+        reward = (new_score - scores[i]) / (scores[i] + 1e-8) * (1 + k / 15)
         rl_agent.update_q_value(action, reward)
 
         if new_score > scores[i]:
@@ -163,7 +165,6 @@ def pso_segmentation(image, n_thresholds, rl_agent):
     gbest_score = np.max(pbest_scores)
 
     for iteration in range(n_iterations):
-        # Standard PSO updates
         for i in range(n_particles):
             r1, r2 = np.random.rand(n_thresholds), np.random.rand(n_thresholds)
             velocities[i] = (w * velocities[i] +
@@ -181,20 +182,18 @@ def pso_segmentation(image, n_thresholds, rl_agent):
                     gbest = particles[i].copy()
                     gbest_score = current_score
 
-        # RL-based local search every 5 iterations
-        if iter % 5 == 0:
+        if iteration % 5 == 0:
             particles, pbest_scores, improved = apply_rl_local_search(
-                image, particles, pbest_scores, rl_agent)
+                image, particles, pbest_scores, rl_agent, n_iterations, n_thresholds)
 
-            # Enhanced early stopping conditions
             if len(rl_agent.reward_history) >= 10:
                 recent_rewards = rl_agent.reward_history[-10:]
                 if (np.mean(recent_rewards) < 0.001 and
                         np.std(recent_rewards) < 0.005):
-                    print(f"Converged at iteration {iter}")
+                    print(f"Converged at iteration {iteration}")
                     break
-            elif iter > n_iterations // 2 and gbest_score - pbest_scores.mean() < 0.01:
-                print(f"Stagnation detected at iteration {iter}")
+            elif iteration > n_iterations // 2 and gbest_score - pbest_scores.mean() < 0.01:
+                print(f"Stagnation detected at iteration {iteration}")
                 break
 
     return np.sort(gbest), gbest_score
@@ -236,32 +235,45 @@ def load_dataset(name='IndianPines'):
 
 
 def main():
-    rl_agent = RLAgent()
     datasets = ['IndianPines', 'Salinas', 'PaviaU']
+    all_results = []
 
     for dataset_name in datasets:
         print(f"\n=== Processing {dataset_name} dataset ===")
         image, gt = load_dataset(dataset_name)
 
-        # Dimensionality reduction
         h, w, d = image.shape
         pca = PCA(n_components=3)
         reduced = pca.fit_transform(image.reshape(-1, d))
         pc1 = reduced[:, 0].reshape(h, w)
         pc1 = ((pc1 - pc1.min()) / (pc1.max() - pc1.min()) * 255).astype(np.uint8)
 
-        for k in [5, 10, 15]:
+        dataset_results = []
+        for k in range(1, 16):  # k from 1 to 15
+            rl_agent = RLAgent()  # New agent for each k
             print(f"\nRunning PSO-RL for k={k} thresholds")
             thresholds, score = pso_segmentation(pc1, k, rl_agent)
-            print(f"Optimal thresholds: {[0] + [int(t) for t in thresholds] + [255]}")
+            thresholds_list = [0] + [int(t) for t in thresholds] + [255]
+            print(f"Optimal thresholds: {thresholds_list}")
             print(f"Fitness score: {score:.4f}")
 
-            # Print RL statistics
-            print("\nRL Agent Performance:")
-            total_actions = sum(rl_agent.action_counts.values())
-            for action, count in rl_agent.action_counts.items():
-                print(f"{action:15s}: {count:3d} uses ({count / total_actions:.1%})")
-            print(f"Average reward: {np.mean(rl_agent.reward_history):.4f}")
+            dataset_results.append({
+                'k': k,
+                'thresholds': thresholds_list,
+                'score': score
+            })
+
+        all_results.append({
+            'dataset': dataset_name,
+            'results': dataset_results
+        })
+
+    # Print all results
+    print("\n=== Final Results ===")
+    for dataset in all_results:
+        print(f"\nDataset: {dataset['dataset']}")
+        for result in dataset['results']:
+            print(f"k={result['k']:2d}: {result['thresholds']} (Score: {result['score']:.4f})")
 
 
 if __name__ == "__main__":
