@@ -265,14 +265,15 @@ def evaluate_segmentation(original, segmented, gt, train_mask):
     y = gt.ravel()
     X = segmented.ravel().reshape(-1, 1)
 
-    # Split into train/test
-    train_idx = train_mask.ravel()
-    test_idx = ~train_mask & (y != 0)  # Exclude background and training pixels
+    # Create test mask (exclude background and training pixels)
+    train_mask_flat = train_mask.ravel()
+    background_mask = (y != 0)
+    test_idx = ~train_mask_flat & background_mask
 
     if np.sum(test_idx) == 0:
         return 0, 0, 0, psnr_val, ssim_val
 
-    X_train, y_train = X[train_idx], y[train_idx]
+    X_train, y_train = X[train_mask_flat], y[train_mask_flat]
     X_test, y_test = X[test_idx], y[test_idx]
 
     # Simple classifier (you can replace with your preferred classifier)
@@ -286,8 +287,11 @@ def evaluate_segmentation(original, segmented, gt, train_mask):
     kappa = cohen_kappa_score(y_test, y_pred)
 
     # Calculate mean accuracy
+    from sklearn.metrics import confusion_matrix
     cm = confusion_matrix(y_test, y_pred)
-    mean_acc = np.mean(np.diag(cm) / np.sum(cm, axis=1))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        mean_acc = np.mean(np.diag(cm) / np.sum(cm, axis=1))
 
     return oa, kappa, mean_acc, psnr_val, ssim_val
 
