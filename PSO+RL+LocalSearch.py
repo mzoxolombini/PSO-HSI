@@ -3,9 +3,15 @@ from scipy.io import loadmat
 from sklearn.decomposition import PCA
 from skimage.util import img_as_ubyte
 from skimage.morphology import disk
+from sklearn.metrics import accuracy_score, cohen_kappa_score
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
 import warnings
 import os
 import urllib.request
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from collections import Counter
 
 warnings.filterwarnings("ignore")
 
@@ -234,6 +240,58 @@ def load_dataset(name='IndianPines'):
     return image, gt
 
 
+def create_train_mask(gt, train_ratio=0.1):
+    train_mask = np.zeros_like(gt, dtype=bool)
+    classes = np.unique(gt)
+    classes = classes[classes != 0]  # Exclude background
+
+    for cls in classes:
+        indices = np.where(gt == cls)
+        n_samples = int(len(indices[0]) * train_ratio)
+        selected = np.random.choice(len(indices[0]), n_samples, replace=False)
+        train_mask[indices[0][selected], indices[1][selected]] = True
+
+    return train_mask
+
+
+def evaluate_segmentation(original, segmented, gt, train_mask):
+    # Calculate PSNR and SSIM
+    data_range = original.max() - original.min()
+    psnr_val = psnr(original, segmented, data_range=data_range)
+    ssim_val = ssim(original, segmented, data_range=data_range)
+
+    # Prepare classification data
+    le = LabelEncoder()
+    y = gt.ravel()
+    X = segmented.ravel().reshape(-1, 1)
+
+    # Split into train/test
+    train_idx = train_mask.ravel()
+    test_idx = ~train_mask & (y != 0)  # Exclude background and training pixels
+
+    if np.sum(test_idx) == 0:
+        return 0, 0, 0, psnr_val, ssim_val
+
+    X_train, y_train = X[train_idx], y[train_idx]
+    X_test, y_test = X[test_idx], y[test_idx]
+
+    # Simple classifier (you can replace with your preferred classifier)
+    from sklearn.ensemble import RandomForestClassifier
+    clf = RandomForestClassifier(n_estimators=100, random_state=42)
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+
+    # Calculate metrics
+    oa = accuracy_score(y_test, y_pred)
+    kappa = cohen_kappa_score(y_test, y_pred)
+
+    # Calculate mean accuracy
+    cm = confusion_matrix(y_test, y_pred)
+    mean_acc = np.mean(np.diag(cm) / np.sum(cm, axis=1))
+
+    return oa, kappa, mean_acc, psnr_val, ssim_val
+
+
 def main():
     datasets = ['IndianPines', 'Salinas', 'PaviaU']
     all_results = []
@@ -248,19 +306,37 @@ def main():
         pc1 = reduced[:, 0].reshape(h, w)
         pc1 = ((pc1 - pc1.min()) / (pc1.max() - pc1.min()) * 255).astype(np.uint8)
 
+        # Create train mask
+        train_mask = create_train_mask(gt)
+
         dataset_results = []
         for k in range(1, 16):  # k from 1 to 15
             rl_agent = RLAgent()  # New agent for each k
             print(f"\nRunning PSO-RL for k={k} thresholds")
             thresholds, score = pso_segmentation(pc1, k, rl_agent)
             thresholds_list = [0] + [int(t) for t in thresholds] + [255]
+
+            # Apply thresholds to create segmented image
+            segmented = np.digitize(pc1, bins=thresholds_list[:-1])
+
+            # Evaluate segmentation
+            oa, kappa, mean_acc, psnr_val, ssim_val = evaluate_segmentation(
+                pc1, segmented, gt, train_mask)
+
             print(f"Optimal thresholds: {thresholds_list}")
             print(f"Fitness score: {score:.4f}")
+            print(f"OA: {oa:.4f}, Kappa: {kappa:.4f}, Mean Acc: {mean_acc:.4f}")
+            print(f"PSNR: {psnr_val:.2f} dB, SSIM: {ssim_val:.4f}")
 
             dataset_results.append({
                 'k': k,
                 'thresholds': thresholds_list,
-                'score': score
+                'score': score,
+                'OA': oa,
+                'Kappa': kappa,
+                'MeanAcc': mean_acc,
+                'PSNR': psnr_val,
+                'SSIM': ssim_val
             })
 
         all_results.append({
@@ -272,8 +348,12 @@ def main():
     print("\n=== Final Results ===")
     for dataset in all_results:
         print(f"\nDataset: {dataset['dataset']}")
+        print("k | Thresholds | Score | OA | Kappa | MeanAcc | PSNR | SSIM")
+        print("-" * 80)
         for result in dataset['results']:
-            print(f"k={result['k']:2d}: {result['thresholds']} (Score: {result['score']:.4f})")
+            print(f"{result['k']:2d} | {result['thresholds']} | {result['score']:.4f} | "
+                  f"{result['OA']:.4f} | {result['Kappa']:.4f} | {result['MeanAcc']:.4f} | "
+                  f"{result['PSNR']:.2f} | {result['SSIM']:.4f}")
 
 
 if __name__ == "__main__":
