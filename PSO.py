@@ -14,7 +14,6 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import RandomForestClassifier
 from collections import Counter
 
-# Try multiple import strategies for GLCM features
 try:
     from skimage.feature import graycomatrix, graycoprops
 except ImportError:
@@ -24,57 +23,16 @@ except ImportError:
         def graycomatrix(*args, **kwargs):
             raise ImportError("GLCM features not available")
 
-
         def graycoprops(*args, **kwargs):
             raise ImportError("GLCM features not available")
 
 warnings.filterwarnings("ignore")
 
-# PSO Parameters
 n_particles = 30
-n_iterations = 50
-w_initial = 0.9  # Initial inertia weight
-c1_initial = 2.5  # Initial cognitive parameter
-c2_initial = 0.5  # Initial social parameter
-
-# RL Parameters
-learning_rate = 0.1
-discount_factor = 0.9
-
-
-class RLAgent:
-    def __init__(self):
-        self.q_values = {
-            'simple_hill': 1.0,
-            'steepest_ascent': 1.0,
-            'stochastic': 1.0,
-            'first_choice': 1.0,
-            'random_restart': 1.0
-        }
-        self.action_counts = {k: 0 for k in self.q_values.keys()}
-        self.reward_history = []
-        self.iteration = 0
-        self.min_exploration = 0.1
-        self.max_exploration = 0.5
-        self.exploration_decay = 0.4
-
-    def choose_action(self, n_iterations):
-        exploration_rate = max(
-            self.min_exploration,
-            self.max_exploration - (self.iteration / n_iterations) * self.exploration_decay
-        )
-        if np.random.random() < exploration_rate:
-            return np.random.choice(list(self.q_values.keys()))
-        return max(self.q_values, key=self.q_values.get)
-
-    def update_q_value(self, action, reward):
-        self.q_values[action] += learning_rate * (
-                reward + discount_factor * max(self.q_values.values()) - self.q_values[action]
-        )
-        self.action_counts[action] += 1
-        self.reward_history.append(reward)
-        self.iteration += 1
-
+n_iterations = 100
+w_initial = 0.9
+c1_initial = 2.5
+c2_initial = 0.5
 
 def compute_fuzzy_entropy(image, thresholds):
     thresholds = np.sort(thresholds)
@@ -90,106 +48,14 @@ def compute_fuzzy_entropy(image, thresholds):
         total += -np.sum(hist * np.log(hist))
     return total
 
-
-def simple_hill_climbing(image, current, current_score, max_neighbors=10):
-    best = current.copy()
-    best_score = current_score
-    for _ in range(max_neighbors):
-        neighbor = np.clip(current + np.random.randint(-5, 6, current.shape), 1, 254)
-        neighbor = np.sort(neighbor)
-        score = compute_fuzzy_entropy(image, neighbor)
-        if score > best_score:
-            best = neighbor
-            best_score = score
-            return best, best_score
-    return best, best_score
-
-
-def steepest_ascent_hill_climbing(image, current, current_score, k, max_neighbors=20):
-    best = current.copy()
-    best_score = current_score
-    max_neighbors = 10 + k * 2
-    for _ in range(max_neighbors):
-        neighbor = np.clip(current + np.random.randint(-5, 6, current.shape), 1, 254)
-        neighbor = np.sort(neighbor)
-        score = compute_fuzzy_entropy(image, neighbor)
-        if score > best_score:
-            best = neighbor
-            best_score = score
-    return best, best_score
-
-
-def stochastic_hill_climbing(image, current, current_score, iteration, max_iterations):
-    neighbor = np.clip(current + np.random.randint(-5, 6, current.shape), 1, 254)
-    neighbor = np.sort(neighbor)
-    score = compute_fuzzy_entropy(image, neighbor)
-    T = 1.0 - (iteration / max_iterations)  # Temperature decay
-    if (score > current_score) or (np.random.rand() < np.exp(-(current_score - score) / (T + 1e-8))):
-        return neighbor, score
-    return current, current_score
-
-
-def first_choice_hill_climbing(image, current, current_score, max_tries=20):
-    for _ in range(max_tries):
-        neighbor = np.clip(current + np.random.randint(-5, 6, current.shape), 1, 254)
-        neighbor = np.sort(neighbor)
-        score = compute_fuzzy_entropy(image, neighbor)
-        if score > current_score:
-            return neighbor, score
-    return current, current_score
-
-
-def random_restart_hill_climbing(image, current, current_score, restarts=3):
-    best = current.copy()
-    best_score = current_score
-    for _ in range(restarts):
-        neighbor = np.random.randint(1, 255, current.shape)
-        neighbor = np.sort(neighbor)
-        score = compute_fuzzy_entropy(image, neighbor)
-        if score > best_score:
-            best = neighbor
-            best_score = score
-    return best, best_score
-
-
-def apply_rl_local_search(image, particles, scores, rl_agent, n_iterations, k):
-    improved = False
-    for i in range(len(particles)):
-        action = rl_agent.choose_action(n_iterations)
-
-        if action == 'simple_hill':
-            new_p, new_score = simple_hill_climbing(image, particles[i], scores[i])
-        elif action == 'steepest_ascent':
-            new_p, new_score = steepest_ascent_hill_climbing(image, particles[i], scores[i], k)
-        elif action == 'stochastic':
-            new_p, new_score = stochastic_hill_climbing(image, particles[i], scores[i],
-                                                        rl_agent.iteration, n_iterations)
-        elif action == 'first_choice':
-            new_p, new_score = first_choice_hill_climbing(image, particles[i], scores[i])
-        elif action == 'random_restart':
-            new_p, new_score = random_restart_hill_climbing(image, particles[i], scores[i])
-
-        reward = (new_score - scores[i]) / (scores[i] + 1e-8) * (1 + k / 15)
-        rl_agent.update_q_value(action, reward)
-
-        if new_score > scores[i]:
-            particles[i] = new_p
-            scores[i] = new_score
-            improved = True
-
-    return particles, scores, improved
-
-
 def add_texture_features(image):
     try:
-        # Convert to uint8 if needed
         if image.dtype != np.uint8:
             image = img_as_ubyte((image - image.min()) / (image.max() - image.min()))
 
-        # ADD MORE TEXTURE MEASURES:
         glcm = graycomatrix(image,
-                            distances=[1, 3, 5],  # Multiple distances
-                            angles=[0, np.pi / 4, np.pi / 2],  # Multiple angles
+                            distances=[1, 3, 5],
+                            angles=[0, np.pi / 4, np.pi / 2],
                             levels=256,
                             symmetric=True,
                             normed=True)
@@ -207,8 +73,7 @@ def add_texture_features(image):
         print(f"Texture features skipped: {str(e)}")
         return np.expand_dims(image, axis=-1)
 
-
-def pso_segmentation(image, n_thresholds, rl_agent):
+def pso_segmentation(image, n_thresholds):
     particles = np.random.randint(1, 255, (n_particles, n_thresholds))
     velocities = np.random.randn(n_particles, n_thresholds) * 10
     w_max, w_min = 0.9, 0.4
@@ -219,8 +84,7 @@ def pso_segmentation(image, n_thresholds, rl_agent):
     gbest_score = np.max(pbest_scores)
 
     for iteration in range(n_iterations):
-        # Update adaptive parameters
-        w = w_max - (w_max-w_min)*(iteration / n_iterations)**0.7
+        w = w_max - (w_max - w_min) * (iteration / n_iterations) ** 0.7
         c1 = c1_initial - (2 * (iteration / n_iterations))
         c2 = c2_initial + (2 * (iteration / n_iterations))
 
@@ -241,20 +105,7 @@ def pso_segmentation(image, n_thresholds, rl_agent):
                     gbest = particles[i].copy()
                     gbest_score = current_score
 
-        if iteration % 5 == 0:
-            particles, pbest_scores, improved = apply_rl_local_search(
-                image, particles, pbest_scores, rl_agent, n_iterations, n_thresholds)
-
-            if len(rl_agent.reward_history) >= 10:
-                recent_rewards = rl_agent.reward_history[-10:]
-                if (np.mean(recent_rewards) < 0.001 and
-                        np.std(recent_rewards) < 0.005):
-                    break
-            elif iteration > n_iterations // 2 and gbest_score - pbest_scores.mean() < 0.01:
-                break
-
     return np.sort(gbest), gbest_score
-
 
 def load_dataset(name='IndianPines'):
     os.makedirs('data', exist_ok=True)
@@ -291,7 +142,6 @@ def load_dataset(name='IndianPines'):
 
     return loadmat(image_file)[keys[0]], loadmat(gt_file)[keys[1]]
 
-
 def create_train_mask(gt, train_ratio=0.1):
     train_mask = np.zeros_like(gt, dtype=bool)
     for cls in np.unique(gt):
@@ -302,7 +152,6 @@ def create_train_mask(gt, train_ratio=0.1):
         selected = np.random.choice(len(indices[0]), n_samples, replace=False)
         train_mask[indices[0][selected], indices[1][selected]] = True
     return train_mask
-
 
 def evaluate_segmentation(original, segmented, gt, train_mask):
     data_range = original.max() - original.min()
@@ -331,7 +180,6 @@ def evaluate_segmentation(original, segmented, gt, train_mask):
 
     return oa, kappa, mean_acc, psnr_val, ssim_val
 
-
 def main():
     datasets = ['IndianPines', 'Salinas', 'PaviaU']
     all_results = []
@@ -341,23 +189,28 @@ def main():
         image, gt = load_dataset(dataset_name)
 
         h, w, d = image.shape
-        pca = PCA(n_components=3)
-        reduced = pca.fit_transform(image.reshape(-1, d))
-        pc1 = reduced[:, 0].reshape(h, w)
 
-        spectral_var = np.var(image, axis=2)  # Calculate spectral variance
-        spectral_var = (spectral_var - spectral_var.min()) / (spectral_var.max() - spectral_var.min()) * 255
-        features = np.dstack((pc1, spectral_var))  # Combined features
+        # Step 1: Reduce spectral dimensions to 1 band (PC1)
+        pca = PCA(n_components=1)
+        reduced = pca.fit_transform(image.reshape(-1, d)).reshape(h, w)
 
-        pc1 = ((pc1 - pc1.min()) / (pc1.max() - pc1.min()) * 255).astype(np.uint8)
+        # Step 2: Normalize and convert to uint8
+        reduced = ((reduced - reduced.min()) / (reduced.max() - reduced.min()) * 255).astype(np.uint8)
 
+        # Step 3: Add texture features to reduced PC1 image
+        features = add_texture_features(reduced)
+
+        # Step 4: pc1 is used for applying thresholds (class assignment)
+        pc1 = reduced
+
+        # Step 5: Create training mask
         train_mask = create_train_mask(gt)
         dataset_results = []
 
+        # Step 6: PSO segmentation and evaluation for k = 1 to 15
         for k in range(1, 16):
-            rl_agent = RLAgent()
-            print(f"\nRunning PSO-RL for k={k} thresholds")
-            thresholds, score = pso_segmentation(features, k, rl_agent)
+            print(f"\nRunning PSO for k={k} thresholds")
+            thresholds, score = pso_segmentation(features, k)
             thresholds_list = [0] + [int(t) for t in thresholds] + [255]
             segmented = np.digitize(pc1, bins=thresholds_list[:-1])
 
@@ -373,7 +226,7 @@ def main():
 
         all_results.append({'dataset': dataset_name, 'results': dataset_results})
 
-    # Print final results
+    # Step 7: Print final summary
     print("\n=== Final Results ===")
     for dataset in all_results:
         print(f"\nDataset: {dataset['dataset']}")
