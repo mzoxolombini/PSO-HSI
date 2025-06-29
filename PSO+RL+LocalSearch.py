@@ -10,11 +10,14 @@ import warnings
 import os
 import urllib.request
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 from collections import Counter
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from skimage.morphology import closing
+from sklearn.svm import SVC
 
-# Try multiple import strategies for GLCM features
 try:
     from skimage.feature import graycomatrix, graycoprops
 except ImportError:
@@ -24,7 +27,6 @@ except ImportError:
         def graycomatrix(*args, **kwargs):
             raise ImportError("GLCM features not available")
 
-
         def graycoprops(*args, **kwargs):
             raise ImportError("GLCM features not available")
 
@@ -32,15 +34,14 @@ warnings.filterwarnings("ignore")
 
 # PSO Parameters
 n_particles = 30
-n_iterations = 50
-w_initial = 0.9  # Initial inertia weight
-c1_initial = 2.5  # Initial cognitive parameter
-c2_initial = 0.5  # Initial social parameter
+n_iterations = 100
+w_initial = 0.9
+c1_initial = 2.5
+c2_initial = 0.5
 
 # RL Parameters
 learning_rate = 0.1
 discount_factor = 0.9
-
 
 class RLAgent:
     def __init__(self):
@@ -69,12 +70,11 @@ class RLAgent:
 
     def update_q_value(self, action, reward):
         self.q_values[action] += learning_rate * (
-                reward + discount_factor * max(self.q_values.values()) - self.q_values[action]
+            reward + discount_factor * max(self.q_values.values()) - self.q_values[action]
         )
         self.action_counts[action] += 1
         self.reward_history.append(reward)
         self.iteration += 1
-
 
 def compute_fuzzy_entropy(image, thresholds):
     thresholds = np.sort(thresholds)
@@ -90,7 +90,6 @@ def compute_fuzzy_entropy(image, thresholds):
         total += -np.sum(hist * np.log(hist))
     return total
 
-
 def simple_hill_climbing(image, current, current_score, max_neighbors=10):
     best = current.copy()
     best_score = current_score
@@ -103,7 +102,6 @@ def simple_hill_climbing(image, current, current_score, max_neighbors=10):
             best_score = score
             return best, best_score
     return best, best_score
-
 
 def steepest_ascent_hill_climbing(image, current, current_score, k, max_neighbors=20):
     best = current.copy()
@@ -118,16 +116,14 @@ def steepest_ascent_hill_climbing(image, current, current_score, k, max_neighbor
             best_score = score
     return best, best_score
 
-
 def stochastic_hill_climbing(image, current, current_score, iteration, max_iterations):
     neighbor = np.clip(current + np.random.randint(-5, 6, current.shape), 1, 254)
     neighbor = np.sort(neighbor)
     score = compute_fuzzy_entropy(image, neighbor)
-    T = 1.0 - (iteration / max_iterations)  # Temperature decay
+    T = 1.0 - (iteration / max_iterations)
     if (score > current_score) or (np.random.rand() < np.exp(-(current_score - score) / (T + 1e-8))):
         return neighbor, score
     return current, current_score
-
 
 def first_choice_hill_climbing(image, current, current_score, max_tries=20):
     for _ in range(max_tries):
@@ -137,7 +133,6 @@ def first_choice_hill_climbing(image, current, current_score, max_tries=20):
         if score > current_score:
             return neighbor, score
     return current, current_score
-
 
 def random_restart_hill_climbing(image, current, current_score, restarts=3):
     best = current.copy()
@@ -151,19 +146,15 @@ def random_restart_hill_climbing(image, current, current_score, restarts=3):
             best_score = score
     return best, best_score
 
-
 def apply_rl_local_search(image, particles, scores, rl_agent, n_iterations, k):
-    improved = False
     for i in range(len(particles)):
         action = rl_agent.choose_action(n_iterations)
-
         if action == 'simple_hill':
             new_p, new_score = simple_hill_climbing(image, particles[i], scores[i])
         elif action == 'steepest_ascent':
             new_p, new_score = steepest_ascent_hill_climbing(image, particles[i], scores[i], k)
         elif action == 'stochastic':
-            new_p, new_score = stochastic_hill_climbing(image, particles[i], scores[i],
-                                                        rl_agent.iteration, n_iterations)
+            new_p, new_score = stochastic_hill_climbing(image, particles[i], scores[i], rl_agent.iteration, n_iterations)
         elif action == 'first_choice':
             new_p, new_score = first_choice_hill_climbing(image, particles[i], scores[i])
         elif action == 'random_restart':
@@ -175,21 +166,19 @@ def apply_rl_local_search(image, particles, scores, rl_agent, n_iterations, k):
         if new_score > scores[i]:
             particles[i] = new_p
             scores[i] = new_score
-            improved = True
 
-    return particles, scores, improved
+    return particles, scores
+
 
 
 def add_texture_features(image):
     try:
-        # Convert to uint8 if needed
         if image.dtype != np.uint8:
             image = img_as_ubyte((image - image.min()) / (image.max() - image.min()))
 
-        # ADD MORE TEXTURE MEASURES:
         glcm = graycomatrix(image,
-                            distances=[1, 3, 5],  # Multiple distances
-                            angles=[0, np.pi / 4, np.pi / 2],  # Multiple angles
+                            distances=[1, 3, 5],
+                            angles=[0, np.pi / 4, np.pi / 2],
                             levels=256,
                             symmetric=True,
                             normed=True)
@@ -207,7 +196,6 @@ def add_texture_features(image):
         print(f"Texture features skipped: {str(e)}")
         return np.expand_dims(image, axis=-1)
 
-
 def pso_segmentation(image, n_thresholds, rl_agent):
     particles = np.random.randint(1, 255, (n_particles, n_thresholds))
     velocities = np.random.randn(n_particles, n_thresholds) * 10
@@ -219,8 +207,7 @@ def pso_segmentation(image, n_thresholds, rl_agent):
     gbest_score = np.max(pbest_scores)
 
     for iteration in range(n_iterations):
-        # Update adaptive parameters
-        w = w_max - (w_max-w_min)*(iteration / n_iterations)**0.7
+        w = w_max - (w_max - w_min) * (iteration / n_iterations) ** 0.7
         c1 = c1_initial - (2 * (iteration / n_iterations))
         c2 = c2_initial + (2 * (iteration / n_iterations))
 
@@ -242,99 +229,98 @@ def pso_segmentation(image, n_thresholds, rl_agent):
                     gbest_score = current_score
 
         if iteration % 5 == 0:
-            particles, pbest_scores, improved = apply_rl_local_search(
-                image, particles, pbest_scores, rl_agent, n_iterations, n_thresholds)
-
-            if len(rl_agent.reward_history) >= 10:
-                recent_rewards = rl_agent.reward_history[-10:]
-                if (np.mean(recent_rewards) < 0.001 and
-                        np.std(recent_rewards) < 0.005):
-                    break
-            elif iteration > n_iterations // 2 and gbest_score - pbest_scores.mean() < 0.01:
-                break
+            particles, pbest_scores = apply_rl_local_search(image, particles, pbest_scores, rl_agent, n_iterations, n_thresholds)
 
     return np.sort(gbest), gbest_score
 
 
-def load_dataset(name='IndianPines'):
-    os.makedirs('data', exist_ok=True)
-    urls = {
-        'IndianPines': (
-            "https://www.ehu.eus/ccwintco/uploads/6/67/Indian_pines_corrected.mat",
-            "https://www.ehu.eus/ccwintco/uploads/c/c4/Indian_pines_gt.mat",
-            ('indian_pines_corrected', 'indian_pines_gt')
-        ),
-        'Salinas': (
-            "https://www.ehu.eus/ccwintco/uploads/a/a3/Salinas_corrected.mat",
-            "https://www.ehu.eus/ccwintco/uploads/f/fa/Salinas_gt.mat",
-            ('salinas_corrected', 'salinas_gt')
-        ),
-        'PaviaU': (
-            "https://www.ehu.eus/ccwintco/uploads/e/ee/PaviaU.mat",
-            "https://www.ehu.eus/ccwintco/uploads/5/50/PaviaU_gt.mat",
-            ('paviaU', 'paviaU_gt')
-        )
-    }
-
-    if name not in urls:
-        raise ValueError(f"Unsupported dataset: {name}")
-
-    url, gt_url, keys = urls[name]
-    image_file = f'data/{name}_corrected.mat'
-    gt_file = f'data/{name}_gt.mat'
-
-    if not os.path.exists(image_file):
-        print(f"Downloading {name} dataset...")
-        urllib.request.urlretrieve(url, image_file)
-    if not os.path.exists(gt_file):
-        urllib.request.urlretrieve(gt_url, gt_file)
-
-    return loadmat(image_file)[keys[0]], loadmat(gt_file)[keys[1]]
-
-
-def create_train_mask(gt, train_ratio=0.1):
-    train_mask = np.zeros_like(gt, dtype=bool)
-    for cls in np.unique(gt):
-        if cls == 0:
-            continue
-        indices = np.where(gt == cls)
-        n_samples = max(1, int(len(indices[0]) * train_ratio))
-        selected = np.random.choice(len(indices[0]), n_samples, replace=False)
-        train_mask[indices[0][selected], indices[1][selected]] = True
-    return train_mask
-
-
-def evaluate_segmentation(original, segmented, gt, train_mask):
-    data_range = original.max() - original.min()
-    psnr_val = psnr(original, segmented, data_range=data_range)
-    ssim_val = ssim(original, segmented, data_range=data_range)
-
-    y = gt.ravel()
-    X = segmented.ravel().reshape(-1, 1)
-    train_mask_flat = train_mask.ravel()
-    test_idx = ~train_mask_flat & (y != 0)
-
-    if np.sum(test_idx) == 0:
-        return 0, 0, 0, psnr_val, ssim_val
-
-    clf = RandomForestClassifier(n_estimators=100, random_state=42)
-    clf.fit(X[train_mask_flat], y[train_mask_flat])
-    y_pred = clf.predict(X[test_idx])
-
-    oa = accuracy_score(y[test_idx], y_pred)
-    kappa = cohen_kappa_score(y[test_idx], y_pred)
-
-    cm = confusion_matrix(y[test_idx], y_pred)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        mean_acc = np.nanmean(np.diag(cm) / np.sum(cm, axis=1))
-
-    return oa, kappa, mean_acc, psnr_val, ssim_val
-
-
 def main():
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import LabelEncoder
+
     datasets = ['IndianPines', 'Salinas', 'PaviaU']
     all_results = []
+
+    def load_dataset(name='IndianPines'):
+        os.makedirs('data', exist_ok=True)
+        urls = {
+            'IndianPines': (
+                "https://www.ehu.eus/ccwintco/uploads/6/67/Indian_pines_corrected.mat",
+                "https://www.ehu.eus/ccwintco/uploads/c/c4/Indian_pines_gt.mat",
+                ('indian_pines_corrected', 'indian_pines_gt')
+            ),
+            'Salinas': (
+                "https://www.ehu.eus/ccwintco/uploads/a/a3/Salinas_corrected.mat",
+                "https://www.ehu.eus/ccwintco/uploads/f/fa/Salinas_gt.mat",
+                ('salinas_corrected', 'salinas_gt')
+            ),
+            'PaviaU': (
+                "https://www.ehu.eus/ccwintco/uploads/e/ee/PaviaU.mat",
+                "https://www.ehu.eus/ccwintco/uploads/5/50/PaviaU_gt.mat",
+                ('paviaU', 'paviaU_gt')
+            )
+        }
+
+        url, gt_url, keys = urls[name]
+        image_file = f'data/{name}_corrected.mat'
+        gt_file = f'data/{name}_gt.mat'
+
+        if not os.path.exists(image_file):
+            urllib.request.urlretrieve(url, image_file)
+        if not os.path.exists(gt_file):
+            urllib.request.urlretrieve(gt_url, gt_file)
+
+        return loadmat(image_file)[keys[0]], loadmat(gt_file)[keys[1]]
+
+    def create_train_mask(gt, train_ratio=0.1):
+        train_mask = np.zeros_like(gt, dtype=bool)
+        for cls in np.unique(gt):
+            if cls == 0:
+                continue
+            indices = np.where(gt == cls)
+            n_samples = max(1, int(len(indices[0]) * train_ratio))
+            selected = np.random.choice(len(indices[0]), n_samples, replace=False)
+            train_mask[indices[0][selected], indices[1][selected]] = True
+        return train_mask
+
+    def apply_postprocessing(segmented_image):
+        return closing(segmented_image, disk(1))
+
+    def extract_features(pc1, spectral_var):
+        texture = \
+        graycoprops(graycomatrix(img_as_ubyte(pc1), [1], [0], levels=256, symmetric=True, normed=True), 'homogeneity')[
+            0, 0]
+        combined = np.dstack([pc1, spectral_var, np.full(pc1.shape, texture)])
+        return combined
+
+    def evaluate_segmentation(original, segmented, gt, train_mask):
+        data_range = original.max() - original.min()
+        psnr_val = psnr(original, segmented, data_range=data_range)
+        ssim_val = ssim(original, segmented, data_range=data_range)
+
+        y = gt.ravel()
+        X = segmented.ravel().reshape(-1, 1)
+        train_mask_flat = train_mask.ravel()
+        test_idx = ~train_mask_flat & (y != 0)
+
+        if np.sum(test_idx) == 0:
+            return 0, 0, 0, psnr_val, ssim_val
+
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        clf = SVC(kernel='rbf', C=10, gamma='scale')
+        clf.fit(X_scaled[train_mask_flat], y[train_mask_flat])
+        y_pred = clf.predict(X_scaled[test_idx])
+
+        oa = accuracy_score(y[test_idx], y_pred)
+        kappa = cohen_kappa_score(y[test_idx], y_pred)
+
+        cm = confusion_matrix(y[test_idx], y_pred)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mean_acc = np.nanmean(np.diag(cm) / np.sum(cm, axis=1))
+
+        return oa, kappa, mean_acc, psnr_val, ssim_val
 
     for dataset_name in datasets:
         print(f"\n=== Processing {dataset_name} dataset ===")
@@ -345,9 +331,9 @@ def main():
         reduced = pca.fit_transform(image.reshape(-1, d))
         pc1 = reduced[:, 0].reshape(h, w)
 
-        spectral_var = np.var(image, axis=2)  # Calculate spectral variance
+        spectral_var = np.var(image, axis=2)
         spectral_var = (spectral_var - spectral_var.min()) / (spectral_var.max() - spectral_var.min()) * 255
-        features = np.dstack((pc1, spectral_var))  # Combined features
+        features = np.dstack((pc1, spectral_var))
 
         pc1 = ((pc1 - pc1.min()) / (pc1.max() - pc1.min()) * 255).astype(np.uint8)
 
@@ -355,8 +341,8 @@ def main():
         dataset_results = []
 
         for k in range(1, 16):
-            rl_agent = RLAgent()
             print(f"\nRunning PSO-RL for k={k} thresholds")
+            rl_agent = RLAgent()
             thresholds, score = pso_segmentation(features, k, rl_agent)
             thresholds_list = [0] + [int(t) for t in thresholds] + [255]
             segmented = np.digitize(pc1, bins=thresholds_list[:-1])
@@ -373,7 +359,6 @@ def main():
 
         all_results.append({'dataset': dataset_name, 'results': dataset_results})
 
-    # Print final results
     print("\n=== Final Results ===")
     for dataset in all_results:
         print(f"\nDataset: {dataset['dataset']}")
@@ -381,7 +366,6 @@ def main():
         for result in dataset['results']:
             print(f"{result['k']:2d} | {result['OA']:.3f} | {result['Kappa']:.3f} | "
                   f"{result['MeanAcc']:.3f} | {result['PSNR']:.2f} | {result['SSIM']:.4f}")
-
 
 if __name__ == "__main__":
     main()
