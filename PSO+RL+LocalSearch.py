@@ -14,9 +14,11 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 from collections import Counter
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
 from skimage.morphology import closing
 from sklearn.svm import SVC
+from scipy.ndimage import median_filter
+from sklearn.model_selection import train_test_split
+
 
 try:
     from skimage.feature import graycomatrix, graycoprops
@@ -235,9 +237,6 @@ def pso_segmentation(image, n_thresholds, rl_agent):
 
 
 def main():
-    from sklearn.model_selection import train_test_split
-    from sklearn.preprocessing import LabelEncoder
-
     datasets = ['IndianPines', 'Salinas', 'PaviaU']
     all_results = []
 
@@ -283,31 +282,20 @@ def main():
             train_mask[indices[0][selected], indices[1][selected]] = True
         return train_mask
 
-    def apply_postprocessing(segmented_image):
-        return closing(segmented_image, disk(1))
-
-    def extract_features(pc1, spectral_var):
-        texture = \
-        graycoprops(graycomatrix(img_as_ubyte(pc1), [1], [0], levels=256, symmetric=True, normed=True), 'homogeneity')[
-            0, 0]
-        combined = np.dstack([pc1, spectral_var, np.full(pc1.shape, texture)])
-        return combined
-
-    def evaluate_segmentation(original, segmented, gt, train_mask):
-        data_range = original.max() - original.min()
-        psnr_val = psnr(original, segmented, data_range=data_range)
-        ssim_val = ssim(original, segmented, data_range=data_range)
-
+    def evaluate_segmentation(segmented, pca_features, gt, train_mask):
+        h, w, d = pca_features.shape
+        segmented_flat = segmented.flatten().reshape(-1, 1)
+        X = np.concatenate([pca_features.reshape(-1, d), segmented_flat], axis=1)
         y = gt.ravel()
-        X = segmented.ravel().reshape(-1, 1)
         train_mask_flat = train_mask.ravel()
         test_idx = ~train_mask_flat & (y != 0)
 
         if np.sum(test_idx) == 0:
-            return 0, 0, 0, psnr_val, ssim_val
+            return 0, 0, 0, 0, 0
 
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
+
         clf = SVC(kernel='rbf', C=10, gamma='scale')
         clf.fit(X_scaled[train_mask_flat], y[train_mask_flat])
         y_pred = clf.predict(X_scaled[test_idx])
@@ -320,7 +308,7 @@ def main():
             warnings.simplefilter("ignore")
             mean_acc = np.nanmean(np.diag(cm) / np.sum(cm, axis=1))
 
-        return oa, kappa, mean_acc, psnr_val, ssim_val
+        return oa, kappa, mean_acc, 0, 0
 
     for dataset_name in datasets:
         print(f"\n=== Processing {dataset_name} dataset ===")
@@ -328,14 +316,8 @@ def main():
 
         h, w, d = image.shape
         pca = PCA(n_components=3)
-        reduced = pca.fit_transform(image.reshape(-1, d))
-        pc1 = reduced[:, 0].reshape(h, w)
-
-        spectral_var = np.var(image, axis=2)
-        spectral_var = (spectral_var - spectral_var.min()) / (spectral_var.max() - spectral_var.min()) * 255
-        features = np.dstack((pc1, spectral_var))
-
-        pc1 = ((pc1 - pc1.min()) / (pc1.max() - pc1.min()) * 255).astype(np.uint8)
+        features_pca = pca.fit_transform(image.reshape(-1, d)).reshape(h, w, 3)
+        pc1 = features_pca[:, :, 0]  # Fix: needed for thresholding
 
         train_mask = create_train_mask(gt)
         dataset_results = []
@@ -343,14 +325,14 @@ def main():
         for k in range(1, 16):
             print(f"\nRunning PSO-RL for k={k} thresholds")
             rl_agent = RLAgent()
-            thresholds, score = pso_segmentation(features, k, rl_agent)
+            thresholds, score = pso_segmentation(pc1, k, rl_agent)
             thresholds_list = [0] + [int(t) for t in thresholds] + [255]
             segmented = np.digitize(pc1, bins=thresholds_list[:-1])
 
             oa, kappa, mean_acc, psnr_val, ssim_val = evaluate_segmentation(
-                pc1, segmented, gt, train_mask)
+                segmented, features_pca, gt, train_mask)
 
-            print(f"k={k}: OA={oa:.4f}, Kappa={kappa:.4f}, PSNR={psnr_val:.2f}dB")
+            print(f"k={k}: OA={oa:.4f}, Kappa={kappa:.4f}")
             dataset_results.append({
                 'k': k, 'thresholds': thresholds_list, 'score': score,
                 'OA': oa, 'Kappa': kappa, 'MeanAcc': mean_acc,
