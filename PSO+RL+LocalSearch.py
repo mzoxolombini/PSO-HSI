@@ -18,6 +18,7 @@ from skimage.morphology import closing
 from sklearn.svm import SVC
 from scipy.ndimage import median_filter
 from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
 
 
 try:
@@ -308,7 +309,26 @@ def main():
             warnings.simplefilter("ignore")
             mean_acc = np.nanmean(np.diag(cm) / np.sum(cm, axis=1))
 
-        return oa, kappa, mean_acc, 0, 0
+        # Compute PSNR and SSIM between PC1 and segmented image
+        pc1 = pca_features[:, :, 0]
+        pc1_uint8 = img_as_ubyte((pc1 - pc1.min()) / (pc1.max() - pc1.min()))
+        segmented_uint8 = img_as_ubyte((segmented - segmented.min()) / (segmented.max() - segmented.min() + 1e-8))
+
+        psnr_val = psnr(pc1_uint8, segmented_uint8, data_range=255)
+        ssim_val = ssim(pc1_uint8, segmented_uint8, data_range=255)
+
+        return oa, kappa, mean_acc, psnr_val, ssim_val
+
+    def visualize_segmentation(segmented, gt, title):
+        fig, axs = plt.subplots(1, 2, figsize=(10, 4))
+        axs[0].imshow(segmented, cmap='nipy_spectral')
+        axs[0].set_title(f"Segmented ({title})")
+        axs[0].axis('off')
+        axs[1].imshow(gt, cmap='nipy_spectral')
+        axs[1].set_title("Ground Truth")
+        axs[1].axis('off')
+        plt.tight_layout()
+        plt.show()
 
     for dataset_name in datasets:
         print(f"\n=== Processing {dataset_name} dataset ===")
@@ -339,6 +359,9 @@ def main():
                 'PSNR': psnr_val, 'SSIM': ssim_val
             })
 
+            if k in [1, 5, 10, 15]:
+                visualize_segmentation(segmented, gt, f"{dataset_name} k={k}")
+
         all_results.append({'dataset': dataset_name, 'results': dataset_results})
 
     print("\n=== Final Results ===")
@@ -351,3 +374,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
