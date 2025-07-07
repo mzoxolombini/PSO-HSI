@@ -10,15 +10,17 @@ import warnings
 import os
 import urllib.request
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler
+from sklearn.ensemble import RandomForestClassifier, BaggingClassifier
 from collections import Counter
 from sklearn.model_selection import train_test_split
-from skimage.morphology import closing
+from skimage.morphology import closing, erosion, dilation, opening
 from sklearn.svm import SVC
 from scipy.ndimage import median_filter
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
+from imblearn.over_sampling import SMOTE
+import time
 
 
 try:
@@ -30,21 +32,23 @@ except ImportError:
         def graycomatrix(*args, **kwargs):
             raise ImportError("GLCM features not available")
 
+
         def graycoprops(*args, **kwargs):
             raise ImportError("GLCM features not available")
 
 warnings.filterwarnings("ignore")
 
-# PSO Parameters
-n_particles = 30
-n_iterations = 100
+# PSO Parameters (updated to match paper)
+n_particles = 50
+n_iterations = 150
 w_initial = 0.9
-c1_initial = 2.5
-c2_initial = 0.5
+c1_initial = 2.0
+c2_initial = 1.5
 
 # RL Parameters
 learning_rate = 0.1
 discount_factor = 0.9
+
 
 class RLAgent:
     def __init__(self):
@@ -73,11 +77,12 @@ class RLAgent:
 
     def update_q_value(self, action, reward):
         self.q_values[action] += learning_rate * (
-            reward + discount_factor * max(self.q_values.values()) - self.q_values[action]
+                reward + discount_factor * max(self.q_values.values()) - self.q_values[action]
         )
         self.action_counts[action] += 1
         self.reward_history.append(reward)
         self.iteration += 1
+
 
 def compute_fuzzy_entropy(image, thresholds):
     thresholds = np.sort(thresholds)
@@ -93,6 +98,7 @@ def compute_fuzzy_entropy(image, thresholds):
         total += -np.sum(hist * np.log(hist))
     return total
 
+
 def simple_hill_climbing(image, current, current_score, max_neighbors=10):
     best = current.copy()
     best_score = current_score
@@ -105,6 +111,7 @@ def simple_hill_climbing(image, current, current_score, max_neighbors=10):
             best_score = score
             return best, best_score
     return best, best_score
+
 
 def steepest_ascent_hill_climbing(image, current, current_score, k, max_neighbors=20):
     best = current.copy()
@@ -119,6 +126,7 @@ def steepest_ascent_hill_climbing(image, current, current_score, k, max_neighbor
             best_score = score
     return best, best_score
 
+
 def stochastic_hill_climbing(image, current, current_score, iteration, max_iterations):
     neighbor = np.clip(current + np.random.randint(-5, 6, current.shape), 1, 254)
     neighbor = np.sort(neighbor)
@@ -128,6 +136,7 @@ def stochastic_hill_climbing(image, current, current_score, iteration, max_itera
         return neighbor, score
     return current, current_score
 
+
 def first_choice_hill_climbing(image, current, current_score, max_tries=20):
     for _ in range(max_tries):
         neighbor = np.clip(current + np.random.randint(-5, 6, current.shape), 1, 254)
@@ -136,6 +145,7 @@ def first_choice_hill_climbing(image, current, current_score, max_tries=20):
         if score > current_score:
             return neighbor, score
     return current, current_score
+
 
 def random_restart_hill_climbing(image, current, current_score, restarts=3):
     best = current.copy()
@@ -149,6 +159,7 @@ def random_restart_hill_climbing(image, current, current_score, restarts=3):
             best_score = score
     return best, best_score
 
+
 def apply_rl_local_search(image, particles, scores, rl_agent, n_iterations, k):
     for i in range(len(particles)):
         action = rl_agent.choose_action(n_iterations)
@@ -157,7 +168,8 @@ def apply_rl_local_search(image, particles, scores, rl_agent, n_iterations, k):
         elif action == 'steepest_ascent':
             new_p, new_score = steepest_ascent_hill_climbing(image, particles[i], scores[i], k)
         elif action == 'stochastic':
-            new_p, new_score = stochastic_hill_climbing(image, particles[i], scores[i], rl_agent.iteration, n_iterations)
+            new_p, new_score = stochastic_hill_climbing(image, particles[i], scores[i], rl_agent.iteration,
+                                                        n_iterations)
         elif action == 'first_choice':
             new_p, new_score = first_choice_hill_climbing(image, particles[i], scores[i])
         elif action == 'random_restart':
@@ -172,6 +184,16 @@ def apply_rl_local_search(image, particles, scores, rl_agent, n_iterations, k):
 
     return particles, scores
 
+
+def add_morphological_features(image, radii=[3, 5]):
+    features = []
+    for r in radii:
+        selem = disk(r)
+        features.append(erosion(image, selem))
+        features.append(dilation(image, selem))
+        features.append(opening(image, selem))
+        features.append(closing(image, selem))
+    return np.dstack(features)
 
 
 def add_texture_features(image):
@@ -198,6 +220,7 @@ def add_texture_features(image):
     except Exception as e:
         print(f"Texture features skipped: {str(e)}")
         return np.expand_dims(image, axis=-1)
+
 
 def pso_segmentation(image, n_thresholds, rl_agent):
     particles = np.random.randint(1, 255, (n_particles, n_thresholds))
@@ -232,7 +255,8 @@ def pso_segmentation(image, n_thresholds, rl_agent):
                     gbest_score = current_score
 
         if iteration % 5 == 0:
-            particles, pbest_scores = apply_rl_local_search(image, particles, pbest_scores, rl_agent, n_iterations, n_thresholds)
+            particles, pbest_scores = apply_rl_local_search(image, particles, pbest_scores, rl_agent, n_iterations,
+                                                            n_thresholds)
 
     return np.sort(gbest), gbest_score
 
@@ -284,40 +308,78 @@ def main():
         return train_mask
 
     def evaluate_segmentation(segmented, pca_features, gt, train_mask):
+        from collections import Counter
+
         h, w, d = pca_features.shape
         segmented_flat = segmented.flatten().reshape(-1, 1)
-        X = np.concatenate([pca_features.reshape(-1, d), segmented_flat], axis=1)
+
+        # Add morphological features
+        morph_features = add_morphological_features(segmented)
+        if len(morph_features.shape) == 2:
+            morph_features = morph_features.reshape(h, w, 1)
+
+        # Combine all features
+        X = np.concatenate([
+            pca_features.reshape(-1, d),
+            segmented_flat,
+            morph_features.reshape(-1, morph_features.shape[2])
+        ], axis=1)
+
         y = gt.ravel()
         train_mask_flat = train_mask.ravel()
         test_idx = ~train_mask_flat & (y != 0)
 
         if np.sum(test_idx) == 0:
-            return 0, 0, 0, 0, 0
+            return 0, 0, 0, 0, 0, 0
 
-        scaler = StandardScaler()
+        # Normalize all features together
+        scaler = MinMaxScaler(feature_range=(-1, 1))
         X_scaled = scaler.fit_transform(X)
 
-        clf = SVC(kernel='rbf', C=10, gamma='scale')
-        clf.fit(X_scaled[train_mask_flat], y[train_mask_flat])
-        y_pred = clf.predict(X_scaled[test_idx])
+        # Create ensemble SVM classifier
+        base_svm = SVC(kernel='rbf', C=10, gamma='scale')
+        clf = BaggingClassifier(estimator=base_svm,
+                                n_estimators=10,
+                                max_samples=0.8,
+                                max_features=0.8,
+                                random_state=42)
 
+        # Dynamically determine SMOTE k_neighbors
+        class_counts = Counter(y[train_mask_flat])
+        min_class_samples = min(class_counts[cls] for cls in class_counts if cls != 0)
+        k_neighbors = min(5, min_class_samples - 1) if min_class_samples > 1 else 1
+
+        try:
+            sm = SMOTE(k_neighbors=k_neighbors, random_state=42)
+            X_res, y_res = sm.fit_resample(X_scaled[train_mask_flat], y[train_mask_flat])
+            X_train, y_train = X_res, y_res
+        except ValueError:
+            # Fallback if SMOTE still fails
+            print("⚠️ SMOTE failed, using original training data without oversampling.")
+            X_train, y_train = X_scaled[train_mask_flat], y[train_mask_flat]
+
+        # Train and predict
+        start_time = time.time()
+        clf.fit(X_train, y_train)
+        y_pred = clf.predict(X_scaled[test_idx])
+        elapsed = time.time() - start_time
+
+        # Calculate metrics
         oa = accuracy_score(y[test_idx], y_pred)
         kappa = cohen_kappa_score(y[test_idx], y_pred)
-
         cm = confusion_matrix(y[test_idx], y_pred)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             mean_acc = np.nanmean(np.diag(cm) / np.sum(cm, axis=1))
 
-        # Compute PSNR and SSIM between PC1 and segmented image
+        # Compute PSNR and SSIM
         pc1 = pca_features[:, :, 0]
         pc1_uint8 = img_as_ubyte((pc1 - pc1.min()) / (pc1.max() - pc1.min()))
         segmented_uint8 = img_as_ubyte((segmented - segmented.min()) / (segmented.max() - segmented.min() + 1e-8))
-
         psnr_val = psnr(pc1_uint8, segmented_uint8, data_range=255)
         ssim_val = ssim(pc1_uint8, segmented_uint8, data_range=255)
 
-        return oa, kappa, mean_acc, psnr_val, ssim_val
+        return oa, kappa, mean_acc, psnr_val, ssim_val, elapsed
 
     def visualize_segmentation(segmented, gt, title):
         fig, axs = plt.subplots(1, 2, figsize=(10, 4))
@@ -337,7 +399,7 @@ def main():
         h, w, d = image.shape
         pca = PCA(n_components=3)
         features_pca = pca.fit_transform(image.reshape(-1, d)).reshape(h, w, 3)
-        pc1 = features_pca[:, :, 0]  # Fix: needed for thresholding
+        pc1 = features_pca[:, :, 0]
 
         train_mask = create_train_mask(gt)
         dataset_results = []
@@ -345,18 +407,22 @@ def main():
         for k in range(1, 16):
             print(f"\nRunning PSO-RL for k={k} thresholds")
             rl_agent = RLAgent()
+            start_time = time.time()
             thresholds, score = pso_segmentation(pc1, k, rl_agent)
+            pso_time = time.time() - start_time
+
             thresholds_list = [0] + [int(t) for t in thresholds] + [255]
             segmented = np.digitize(pc1, bins=thresholds_list[:-1])
 
-            oa, kappa, mean_acc, psnr_val, ssim_val = evaluate_segmentation(
+            oa, kappa, mean_acc, psnr_val, ssim_val, class_time = evaluate_segmentation(
                 segmented, features_pca, gt, train_mask)
 
-            print(f"k={k}: OA={oa:.4f}, Kappa={kappa:.4f}")
+            print(f"k={k}: OA={oa:.4f}, Kappa={kappa:.4f}, PSO Time={pso_time:.2f}s, Class Time={class_time:.2f}s")
             dataset_results.append({
                 'k': k, 'thresholds': thresholds_list, 'score': score,
                 'OA': oa, 'Kappa': kappa, 'MeanAcc': mean_acc,
-                'PSNR': psnr_val, 'SSIM': ssim_val
+                'PSNR': psnr_val, 'SSIM': ssim_val,
+                'PSO_Time': pso_time, 'Class_Time': class_time
             })
 
             if k in [1, 5, 10, 15]:
@@ -367,11 +433,12 @@ def main():
     print("\n=== Final Results ===")
     for dataset in all_results:
         print(f"\nDataset: {dataset['dataset']}")
-        print("k | OA | Kappa | MeanAcc | PSNR | SSIM")
+        print("k | OA | Kappa | MeanAcc | PSNR | SSIM | PSO Time | Class Time")
         for result in dataset['results']:
             print(f"{result['k']:2d} | {result['OA']:.3f} | {result['Kappa']:.3f} | "
-                  f"{result['MeanAcc']:.3f} | {result['PSNR']:.2f} | {result['SSIM']:.4f}")
+                  f"{result['MeanAcc']:.3f} | {result['PSNR']:.2f} | {result['SSIM']:.4f} | "
+                  f"{result['PSO_Time']:.2f}s | {result['Class_Time']:.2f}s")
+
 
 if __name__ == "__main__":
     main()
-
